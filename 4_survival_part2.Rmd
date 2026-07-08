@@ -1,0 +1,825 @@
+---
+title: "Survival Analysis"
+author: "Denis Rustand"
+date: "July 8 and 9, 2026"
+subtitle: |
+  Bayesian survival, longitudinal and joint models with INLA \
+  VIBASS 9, Valencia, Spain
+output:
+  html_document:
+    toc: false
+    toc_float: false
+    theme: flatly
+    mathjax: default
+  pdf_document:
+    toc: false
+---
+
+```{=html}
+<style>
+pre, pre code {
+  white-space: pre !important;
+  overflow-x: auto !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+</style>
+```
+
+```{r setup, include=FALSE}
+options(width = 200)
+knitr::opts_chunk$set(cache = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+```
+
+```{r, cache=FALSE}
+library(INLA)
+library(INLAjoint)
+library(ggplot2)
+library(ggpubr)
+library(survival)
+```
+
+# What do we observe?
+
+```{r}
+load("cancer_trial_data.RData")
+survDat$Treatment <- factor(survDat$trt, levels = c(0, 1),
+                            labels = c("B (chemo)", "A (immuno)"))
+head(survDat)
+str(survDat)
+summary(survDat)
+```
+
+For each patient, we record a time and an indicator: did the patient die, or were they still alive at their last observation? Patients who are still alive are **censored**: we know they survived at least that long, but not how much longer they will live.
+
+## Event time distributions by treatment arm
+
+```{r}
+ggplot(survDat, aes(x = deathTimes, fill = factor(trt))) +
+  geom_density(alpha = 0.4) +
+  labs(x = "Time (years)", y = "Density", fill = "Treatment") +
+  scale_fill_manual(values = c("gray40", "steelblue"),
+                    labels = c("B (chemo)", "A (immuno)")) +
+  theme_minimal()
+```
+
+[Can we tell which treatment is better from density plots alone?]{style="color: steelblue;"} Not really..
+
+## Kaplan-Meier curves
+
+The Kaplan-Meier estimator is the standard non-parametric tool for estimating the survival function:
+
+```{r}
+km <- survfit(Surv(deathTimes, death) ~ trt, data = survDat)
+plot(km, conf.int = TRUE, col = c("gray40", "steelblue"), lwd = 2,
+     xlab = "Time (years)", ylab = "Survival probability",
+     main = "Kaplan-Meier by treatment arm")
+legend("topright", c("B (chemo)", "A (immuno)"),
+       col = c("gray40", "steelblue"), lwd = 2)
+```
+
+The curves overlap substantially. [Is there a statistically significant difference?]{style="color: steelblue;"}
+
+```{r}
+survdiff(Surv(deathTimes, death) ~ trt, data = survDat)
+```
+
+The log-rank test gives us a p-value, but that is all. We cannot quantify the treatment effect, adjust for covariates, or make individual predictions. We need regression models which brings us to the formal language of survival analysis.
+
+# Survival quantities
+
+## Key functions
+
+| Quantity | Notation | Interpretation |
+|------------------------|------------------------|------------------------|
+| Survival | $S(t) = P(T > t)$ | Probability of surviving past time $t$ |
+| Density | $f(t) = -dS(t)/dt$ | Rate of events at exactly time $t$ |
+| Hazard | $\lambda(t) = f(t)/S(t)$ | Instantaneous risk, given survival to $t$ |
+| Cumulative hazard | $\Lambda(t) = -\log S(t)$ | Accumulated risk up to $t$ |
+
+The hazard is not a probability, it can exceed 1. It measures the instantaneous event rate among survivors.
+
+## Censoring
+
+In our trial, not every patient dies during follow-up. For censored patients, we know they survived **at least** until their last observation.
+
+We observe: $\min(T, C)$ and an indicator $\delta = I(T \leq C)$.
+
+Assumption: non-informative censoring (censoring is unrelated to the underlying event risk).
+
+# Back to slides : Survival regression models
+
+## The proportional hazards model
+
+$$\lambda_i(t) = \lambda_0(t) \exp(\mathbf{X}_i^T \boldsymbol{\gamma})$$
+
+- $\lambda_0(t)$: baseline hazard (shape of the risk over time)
+- $\exp(\gamma)$: hazard ratio for a unit increase in $X$
+- PH assumption: the hazard ratio is constant over time
+
+In our trial: $\lambda_i(t) = \lambda_0(t) \exp(\gamma \cdot \text{trt}_i)$
+
+# Unspecified baseline: the standard Cox model
+
+The most famous approach to the proportional hazards model is the **Cox model**. Its strengths lies in avoiding direct estimation of the baseline hazard $\lambda_0(t)$.
+
+Let's fit it using the standard `survival` package on our cancer trial data:
+
+```{r}
+# Fit a standard Cox model using partial likelihood
+M_cox <- coxph(Surv(deathTimes, death) ~ trt, data = survDat)
+summary(M_cox)
+```
+
+The model gives us the treatment log-hazard ratio (`coef`), the hazard ratio (`exp(coef)`), and the p-values. It achieves this using a mathematical trick called **partial likelihood**: it evaluates the probability that the observed event occurred to the specific individual who failed, conditional on the risk set at that exact time. Because $\lambda_0(t)$ is common to all individuals at risk at time $t$, it mathematically cancels out.
+
+## Why do we approximate the baseline hazard in INLAjoint?
+
+If the standard Cox model is so elegant, fast, and requires zero assumptions about the shape of the baseline hazard, [**why do we need to approximate the baseline hazard?**]{style="color: steelblue;"}
+
+1.  **The mathematical trick breaks down for complex models.** When we introduce modeling complexity (such as **Joint Models** where the survival risk depends on the continuously updating trajectory of a longitudinal biomarker) the likelihoods are connected. We can no longer simply "cancel out" the baseline hazard.
+
+2.  **We need the baseline to predict the future.** The Cox model provides *relative* risks (hazard ratios), but it does not naturally provide *absolute* risks. If a clinician asks, *"What is the probability this specific patient survives the next 3 years?"*, we must calculate
+
+$$S(t) = \exp \left( -\int_0^t \lambda_0(u)\exp(\mathbf{X}^T \boldsymbol{\gamma}) du \right).$$
+
+Without an explicitly estimated $\lambda_0(t)$, we cannot compute this integral for personalized dynamic predictions.
+
+Let's see how `INLAjoint` specifies the baseline, starting with simple parametric shapes and building our way up to highly flexible approximations.
+
+# Parametric baselines
+
+Parametric baselines are the simplest way to make $\lambda_0(t)$ explicit. They are interpretable and fast, but the shape assumption is strong.
+
+## Exponential: constant hazard
+
+The exponential model is the simplest: $\lambda_0(t) = \mu$. It assumes the risk of the event is constant over time. Let us simulate data with a known truth and check that the model recovers it.
+
+```{r}
+set.seed(1)
+n_sim <- 500
+gamma_true <- 0.3 # true log-HR
+mu_true <- 0.2 # true baseline rate
+
+trt_sim <- rbinom(n_sim, 1, 0.5)
+# Inverse Transform Sampling
+event_times <- -log(runif(n_sim)) / (mu_true * exp(gamma_true * trt_sim))
+cens_times <- runif(n_sim, 0, 4)
+obs_times <- pmin(event_times, cens_times)
+event <- as.integer(event_times <= cens_times)
+
+simDat <- data.frame(id = 1:n_sim, time = obs_times,
+                     event = event, trt = trt_sim)
+cat("Events:", sum(event), "/", n_sim)
+```
+
+We fit this using `basRisk = "exponentialsurv"`:
+
+```{r}
+M_exp <- joint(
+  formSurv = inla.surv(time, event) ~ trt,
+  dataSurv = simDat,
+  basRisk = "exponentialsurv"
+)
+summary(M_exp, hr = TRUE)
+```
+
+```{r}
+cat("Estimated treatment effect:", round(M_exp$summary.fixed["trt_S1", "mean"], 3),
+    "(credible interval = [", round(M_exp$summary.fixed["trt_S1", "0.025quant"], 3), ";",
+    round(M_exp$summary.fixed["trt_S1", "0.975quant"], 3), "])",
+    "\nTrue value:", gamma_true)
+```
+
+```{r}
+plot(M_exp)$Baseline + geom_hline(yintercept = mu_true, colour=2, linetype=2) + ylim(0,0.5)
+```
+
+## Weibull: adding a shape parameter
+
+The Weibull distribution generalizes the exponential by adding a **shape** parameter $\alpha$:
+
+$$\lambda_0(t) = \alpha \mu t^{\alpha - 1}$$
+
+| Shape        | Behavior               | Clinical example               |
+|--------------|------------------------|--------------------------------|
+| $\alpha < 1$ | Decreasing hazard      | Early mortality (post-surgery) |
+| $\alpha = 1$ | Constant (exponential) | Rare                           |
+| $\alpha > 1$ | Increasing hazard      | Chronic disease progression    |
+
+Let's simulate a scenario with an increasing hazard ($\alpha = 1.3$):
+
+```{r}
+set.seed(3)
+alpha_true <- 1.3 # increasing hazard
+mu_true_w <- 0.2
+gamma_true_w <- -0.5  # treatment is beneficial
+
+trt_w <- rbinom(1000, 1, 0.5)
+event_times_w <- (-log(runif(1000)) /
+                    (mu_true_w * exp(gamma_true_w * trt_w)))^(1 / alpha_true)
+cens_times_w <- runif(1000, 0, 4)
+obs_times_w <- pmin(event_times_w, cens_times_w)
+event_w <- as.integer(event_times_w <= cens_times_w)
+
+simDat_w <- data.frame(id = 1:1000, time = obs_times_w,
+                       event = event_w, trt = trt_w)
+```
+
+We fit this using `basRisk = "weibullsurv"`:
+
+```{r}
+M_wei <- joint(
+  formSurv = inla.surv(time, event) ~ trt,
+  dataSurv = simDat_w,
+  basRisk = "weibullsurv"
+)
+summary(M_wei, hr = TRUE)
+```
+
+```{r}
+cat("Treatment effect: estimated =", round(M_wei$summary.fixed["trt_S1", "mean"], 3),
+    ", true =", gamma_true_w)
+```
+
+```{r}
+bw <- function(t) alpha_true*mu_true_w*t^(alpha_true-1) # true
+plot(M_wei)$Baseline + geom_function(fun = bw, colour = 2, linetype=2)
+```
+
+=\> [The INLA approach to replicate Cox : Data augmentation]{style="color: purple;"}
+
+# Semi-parametric baselines: the Poisson approximation
+
+Parametric baselines are useful, but they are rigid. Traditional approaches often use splines for the baseline hazard. That gives flexibility, but it also requires choices about knot number, knot placement, and smoothness.
+
+To flexibly estimate the baseline hazard without enforcing a simple shape, `INLAjoint` uses a Poisson approximation (Holford, 1980; Laird & Olivier, 1981).
+
+We divide the follow-up period into $K$ small, contiguous time intervals. If the intervals are narrow enough, we can assume the baseline hazard is constant within each interval. This data expansion transforms the survival likelihood into a **Poisson regression likelihood**. Each patient contributes a Poisson count (event = 1 or 0) and an exposure time for each interval they visit.
+
+The full log-likelihood for right-censored survival data is:
+
+$$\log L = \sum_{i=1}^n \left[ \delta_i \log \lambda_i(t_i) - \Lambda_i(t_i) \right],$$
+
+where $\delta_i$ is the event indicator and $\Lambda_i(t_i) = \int_0^{t_i} \lambda_i(u) du$.
+
+If we partition follow-up into $K$ intervals and assume the baseline hazard $\lambda_{0k}$ is constant within interval $k$, the cumulative hazard becomes a sum over the time spent in each interval ($y_{ik}$). The log-likelihood can be rewritten as:
+
+$$\log L = \sum_{i=1}^n \sum_{k=1}^K \left[ \delta_{ik} \log(\lambda_{0k} \exp(\mathbf{X}_i^T \boldsymbol{\gamma})) - \lambda_{0k} y_{ik} \exp(\mathbf{X}_i^T \boldsymbol{\gamma}) \right].$$
+
+This is mathematically equivalent to a Poisson regression where the event indicator $\delta_{ik} \in \{0,1\}$ is the response and the time at risk $y_{ik}$ is an offset.
+
+If we estimate a separate hazard for each interval independently, the curve will be extremely noisy. To fix this, `INLAjoint` applies a Bayesian **random walk** prior to the interval-specific log-hazards:
+
+- **RW1 (`basRisk = "rw1"`)**: penalizes the difference between adjacent intervals.
+- **RW2 (`basRisk = "rw2"`)**: penalizes second-order differences, encouraging a smoother curve by penalizing abrupt changes in slope.
+
+The degree of smoothness is not guessed, it is controlled by a precision hyperparameter estimated from the data. As the number of intervals increases, this Poisson approximation gets closer to the Cox model while still providing an explicit baseline hazard for absolute prediction.
+
+By splitting the follow-up, `INLAjoint` transforms the survival problem into a Poisson model. Under the hood, the data expansion looks like this:
+
+```{r}
+# INLA expands the data by splitting the follow-up time into intervals
+Expanded_data <- inla.coxph(inla.surv(deathTimes, death) ~ trt, data = survDat)
+
+cat("Original data for patient 1:\n")
+print(survDat[1, c("id", "deathTimes", "death", "trt")], row.names = FALSE)
+
+cat("\nPoisson expanded data for patient 1 (first 3 intervals):\n")
+print(head(Expanded_data$data[Expanded_data$data$expand..coxph == 1,
+                              c("baseline.hazard", "E..coxph", "y..coxph")], 3))
+```
+
+Here, `baseline.hazard` is the time interval, `E..coxph` is the time at risk during that interval, and `y..coxph` is the Poisson count (1 if the event occurred in that specific interval, 0 otherwise).
+
+Let's fit the RW2 model on our cancer data and check whether it recovers the Cox treatment estimate:
+
+```{r}
+M_rw2_cancer <- joint(
+  formSurv = inla.surv(deathTimes, death) ~ trt,
+  dataSurv = survDat,
+  basRisk = "rw2",
+  id = "id",
+  control = list(int.strategy = "eb") # Empirical Bayes for speed
+)
+```
+
+```{r}
+cat("Treatment log-HR (Cox):      ", round(coef(M_cox)["trt"], 4), "\n")
+cat("Treatment log-HR (INLA RW2): ", round(M_rw2_cancer$summary.fixed["trt_S1", "mean"], 4))
+```
+
+The estimates are very similar! We have recovered the treatment effect of the standard Cox model, but with a major advantage: we now possess a fully specified, data-driven baseline hazard that we can use to make absolute predictions.
+
+To see the RW prior directly, we can refit the Weibull simulation using RW1 and RW2:
+
+```{r}
+M_rw1 <- joint(
+  formSurv = inla.surv(time, event) ~ trt,
+  dataSurv = simDat_w,
+  basRisk = "rw1"#, NbasRisk = 100
+)
+
+M_rw2 <- joint(
+  formSurv = inla.surv(time, event) ~ trt,
+  dataSurv = simDat_w,
+  basRisk = "rw2"#, NbasRisk = 100
+)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+plot(M_rw1, main = "RW1 baseline (Weibull data)")$Baseline + geom_function(fun = bw, colour = 2, linetype=2)
+plot(M_rw2, main = "RW2 baseline (Weibull data)")$Baseline + geom_function(fun = bw, colour = 2, linetype=2)
+```
+
+Both RW1 and RW2 capture the underlying increasing hazard of the Weibull simulation, with RW2 giving a slightly smoother curve.
+
+# Beyond parametric assumptions
+
+[What if the true hazard is neither constant nor strictly monotone? Can a Weibull curve follow a risk that rises and then falls?]{style="color: steelblue;"}
+
+Consider a **hump-shaped** hazard that starts near zero, peaks around $t = 2$, then declines. This happens often in health research, for example when risk is highest shortly after an operation or exposure and then drops among survivors.
+
+Neither the exponential nor the Weibull model can capture this shape.
+
+```{r}
+set.seed(1)
+n_hump <- 500
+gamma_hump <- -0.4
+
+# True hazard: h0(t) = scale * t * exp(-0.5*t), peaking at t = 2
+# Cumulative hazard: H0(t) = scale * [4 - (2t+4)*exp(-0.5t)]
+scale_h <- 1.5
+
+trt_h <- rbinom(n_hump, 1, 0.5)
+
+H0 <- function(t) scale_h * (4 - (2*t + 4) * exp(-0.5 * t))
+
+gen_event <- function(g) {
+  U <- runif(1)
+  target <- -log(U) / exp(g)
+  H0_max <- 4 * scale_h
+  if (target > H0_max * 0.99) return(100)
+  uniroot(function(t) H0(t) - target, c(1e-6, 200), tol = 1e-8)$root
+}
+
+event_times_h <- sapply(gamma_hump * trt_h, gen_event)
+cens_times_h <- runif(n_hump, 0, 8)
+obs_times_h <- pmin(event_times_h, cens_times_h)
+event_h <- as.integer(event_times_h <= cens_times_h)
+
+simDat_h <- data.frame(id = 1:n_hump, time = obs_times_h,
+                       event = event_h, trt = trt_h)
+cat("Events:", sum(event_h), "/", n_hump)
+```
+
+Let's fit all three baseline specifications:
+
+```{r}
+MH_exp <- joint(formSurv = inla.surv(time, event) ~ trt,
+                dataSurv = simDat_h, basRisk = "exponentialsurv")
+
+MH_wei <- joint(formSurv = inla.surv(time, event) ~ trt,
+                dataSurv = simDat_h, basRisk = "weibullsurv")
+
+MH_rw2 <- joint(formSurv = inla.surv(time, event) ~ trt,
+                dataSurv = simDat_h, basRisk = "rw2",
+                control = list(int.strategy = "eb"))
+```
+
+First, let's look at the estimated treatment effects:
+
+```{r}
+cat("Treatment effect (true =", gamma_hump, "):\n")
+cat("  Exponential:", round(MH_exp$summary.fixed["trt_S1", "mean"], 3),"\n")
+cat("  Weibull:    ", round(MH_wei$summary.fixed["trt_S1", "mean"], 3),"\n")
+cat("  RW2:        ", round(MH_rw2$summary.fixed["trt_S1", "mean"], 3))
+```
+
+Because of the proportional hazards property, the treatment effect is somewhat protected and recovered reasonably well by all three models. The baseline hazard tells a different story.
+
+We do not use DIC or WAIC to rank the parametric models against the RW2 model here, because the RW2 model uses the expanded Poisson data representation while the parametric models use the survival likelihood directly. Instead, we compare the baseline hazards visually.
+
+```{r}
+# Extract baseline hazards using the plot() function data
+P_exp <- plot(MH_exp)$Baseline$data
+P_wei <- plot(MH_wei)$Baseline$data
+P_rw2 <- plot(MH_rw2)$Baseline$data
+
+# RW2 estimates are interval-level hazards, so plot them at interval midpoints.
+rw2_width <- c(diff(P_rw2$ID), tail(diff(P_rw2$ID), 1))
+rw2_time <- P_rw2$ID + rw2_width / 2
+
+# True mathematical hazard
+tt <- seq(0, 8, length = 200)
+h_true <- scale_h * tt * exp(-0.5 * tt)
+
+plot(P_exp$x, P_exp$y, type = "l", lwd = 2, col = "blue", lty = 2,
+     xlab = "Time", ylab = "Baseline hazard",
+     main = "RW2 captures a non-monotone baseline hazard",
+     xlim = range(tt),
+     ylim = c(0, max(c(P_exp$upper, P_wei$upper, exp(P_rw2$q975quant), h_true)) * 1.1))
+
+lines(P_wei$x, P_wei$y, lwd = 2, col = "darkorange", lty = 2)
+polygon(c(rw2_time, rev(rw2_time)),
+        c(exp(P_rw2$q025quant), rev(exp(P_rw2$q975quant))),
+        col = rgb(0, 0, 0, 0.15), border = NA)
+lines(rw2_time, exp(P_rw2$q5quant), lwd = 2, col = "black")
+lines(tt, h_true, col = "red", lwd = 3)
+
+legend("topright",
+       c("True hazard", "RW2", "Exponential", "Weibull"),
+       col = c("red", "black", "blue", "darkorange"),
+       lwd = c(3, 2, 2, 2), lty = c(1, 1, 2, 2))
+```
+
+The visual comparison is clear:
+
+- The **exponential** model draws a flat line, assuming constant risk.
+- The **Weibull** model is more flexible, but it is still forced to draw a monotone curve.
+- The **RW2** model closely follows the true peaked risk dynamic.
+
+By using the Poisson approximation and the RW2 smoother, `INLAjoint` provides the best of both worlds: Cox-like flexibility and a fully specified baseline hazard needed for dynamic predictions and joint modeling.
+
+# Application to the cancer trial
+
+Now we return to our real-world cancer trial data (`survDat`) loaded at the top of this module.
+
+## RW2 survival model
+
+We already fitted a proportional hazards model with a flexible RW2 baseline hazard and treatment as the covariate:
+
+$$\lambda_i(t) = \lambda_0(t) \exp(\gamma \cdot \text{trt}_i).$$
+
+```{r}
+summary(M_rw2_cancer)
+```
+
+The key output is `trt_S1`, the estimated treatment effect on the log-hazard scale. We can ask `INLAjoint` to exponentiate this to give us the hazard ratio:
+
+```{r}
+summary(M_rw2_cancer, hr = TRUE)$SurvEff
+```
+
+Notice the 95% credible interval. [Does the interval include 1?]{style="color: steelblue;"} [If it does, we cannot claim a survival benefit for this treatment at the population-average level.]{style="color: #c55a11;"}
+
+## Comparing baseline specifications on real data
+
+Let's test if our choice of baseline hazard changes the treatment-effect conclusion on the real trial data:
+
+```{r}
+MC_exp <- joint(formSurv = inla.surv(deathTimes, death) ~ trt,
+                dataSurv = survDat, basRisk = "exponentialsurv")
+
+MC_wei <- joint(formSurv = inla.surv(deathTimes, death) ~ trt,
+                dataSurv = survDat, basRisk = "weibullsurv")
+
+MC_rw1 <- joint(formSurv = inla.surv(deathTimes, death) ~ trt,
+                dataSurv = survDat, basRisk = "rw1",
+                id = "id", control = list(int.strategy = "eb"))
+```
+
+```{r}
+# Treatment effect (log-HR) by baseline:
+# Exponential:
+MC_exp$summary.fixed["trt_S1", 1:6]
+# Weibull:
+MC_wei$summary.fixed["trt_S1", 1:6]
+# RW1:
+MC_rw1$summary.fixed["trt_S1", 1:6]
+# RW2:
+M_rw2_cancer$summary.fixed["trt_S1", ]
+```
+
+The treatment effect remains stable across baseline choices. [Regardless of how we model the baseline risk, the survival-only analysis does not find a treatment difference.]{style="color: #c55a11;"}
+
+DIC is still useful, but only when we compare models fitted with the same likelihood/data representation. We can compare exponential versus Weibull, and RW1 versus RW2, but we cannot compare the parametric survival likelihood directly against a Poisson-expanded RW likelihood.
+
+```{r}
+# DIC and WAIC within parametric survival likelihoods (lower is better!):
+# Exponential:"
+MC_exp$dic$dic
+MC_exp$waic$waic
+# Weibull:
+MC_wei$dic$dic
+MC_wei$waic$waic
+# DIC within Poisson-expanded RW likelihoods:
+# RW1:
+MC_rw1$dic$dic
+MC_rw1$waic$waic
+# RW2:
+M_rw2_cancer$dic$dic
+M_rw2_cancer$waic$waic
+# Details on the metric:
+str(M_rw2_cancer$waic)
+```
+
+Let's visualize the flexible baselines on the cancer data:
+
+```{r}
+d1 <- plot(MC_exp)$Baseline$data[c("x", "y", "lower", "upper")]
+d2 <- plot(MC_wei)$Baseline$data[c("x", "y", "lower", "upper")]
+d3 <- plot(MC_rw1)$Baseline$data[c("ID", "q5quant", "q025quant", "q975quant")]
+d4 <- plot(M_rw2_cancer)$Baseline$data[c("ID", "q5quant", "q025quant", "q975quant")]
+d3[-1] <- exp(d3[-1])
+d4[-1] <- exp(d4[-1])
+names(d3) <- names(d4) <- names(d1)
+dat <- do.call(rbind, Map(cbind, list(d1, d2, d3, d4), Model = c("Exponential", "Weibull", "RW1", "RW2")))
+
+ggplot(dat, aes(x = x, y = y, color = Model, fill = Model, linetype = Model)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 0.8) + 
+  labs(x = "Time", y = "Baseline risk") +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.title = element_blank())
+```
+
+## Survival predictions
+
+Because `INLAjoint` explicitly modeled the baseline hazard, we can now do what the standard Cox model could not do directly: compute absolute survival probabilities for specific patients.
+
+Let's predict the survival trajectory for two hypothetical patients entering the trial today:
+
+```{r}
+NewS <- data.frame(id = c(1, 2),
+                   deathTimes = c(0, 0),
+                   death = c(0, 0),
+                   trt = c(0, 1))
+
+# Predict out to 5 years
+P_rw2_cancer <- predict(M_rw2_cancer, newData = NewS, horizon = 5,
+                        survival = TRUE, id = "id")
+```
+
+```{r}
+P_rw2_cancer$PredS$Group <- factor(ifelse(P_rw2_cancer$PredS$id == 1, "B (chemo)", "A (immuno)"))
+
+ggplot(P_rw2_cancer$PredS, aes(x = deathTimes, y = Surv_quant0.5, color = Group, fill = Group)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = Surv_quant0.025, ymax = Surv_quant0.975),
+              alpha = 0.15, color = NA) +
+  labs(x = "Time (years)", y = "Survival probability",
+       title = "Predicted absolute survival (RW2 model)") + ylim(0, 1)
+```
+
+## Conditional survival
+
+Clinicians often ask dynamic questions: [*If a patient has already survived past year 1, what is their updated prognosis?*]{style="color: steelblue;"}
+
+We can compute conditional survival by setting `Csurv = 1`:
+
+```{r}
+P_cond <- predict(M_rw2_cancer, newData = NewS, horizon = 5, 
+                  survival = TRUE, id = "id", Csurv = 1)
+P_cond$PredS$Group <- factor(ifelse(P_cond$PredS$id == 1, "B (chemo)", "A (immuno)"))
+
+ggplot(P_cond$PredS, aes(x = deathTimes, y = Surv_quant0.5, color = Group, fill = Group)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = Surv_quant0.025, ymax = Surv_quant0.975),
+              alpha = 0.15) +
+  labs(x = "Time (years)", y = "P(T > t | T > 1)",
+       title = "Conditional survival for treatment A (given alive at year 1)") +
+  ylim(0, 1) + theme_minimal()
+```
+
+The survival probability is 100% up to year 1 because we are conditioning on the fact that the patient is confirmed alive at that landmark.
+
+# Priors for the parameters
+
+Posterior = prior + data. Defaults are weakly informative. Data usually wins. Not always.
+
+## Fixed effects
+
+Default: Gaussian, mean 0, variance 100. Vague on the scaled covariate.
+
+```{r priors_default, message=FALSE}
+M_exp$priors_used$priorFixed   # mean 0, prec 0.01
+```
+
+A tighter but reasonable prior, N(-1, 1). Still covers the truth.
+
+```{r priors_reasonable, message=FALSE, fig.width=7, fig.height=3}
+M_exp_inf <- joint(
+  formSurv = inla.surv(time, event) ~ trt,
+  dataSurv = simDat, basRisk = "exponentialsurv",
+  control = list(priorFixed = list(mean = -1, prec = 1))
+)
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1), cex = 0.8)
+
+# Baseline Plot
+p1 <- M_exp_inf$marginals.fixed$Intercept_S1
+curve(dnorm(x, -1, 1), -3, 3, lwd = 2, ylim = c(0, max(p1[, 2])),
+      main = "Baseline log-rate", xlab = "", ylab = "Density")
+lines(p1, col = 2, lty = 2, lwd = 2)
+abline(v = log(mu_true), col = 4, lty = 3, lwd = 2)
+legend("topright", c("prior", "posterior", "true"),
+       lty = 1:3, col = c(1, 2, 4), lwd = 2, bty = "n", cex = 0.7)
+
+# Treatment Plot
+p2 <- M_exp_inf$marginals.fixed$trt_S1
+curve(dnorm(x, -1, 1), -3, 3, lwd = 2, ylim = c(0, max(p2[, 2])),
+      main = "Treatment effect", xlab = "", ylab = "")
+lines(p2, col = 2, lty = 2, lwd = 2)
+abline(v = gamma_true, col = 4, lty = 3, lwd = 2)
+```
+
+Posterior sits on the true value. Mostly data-driven.
+
+[What happens when the prior is confident but points the wrong way?]{style="color: steelblue;"}
+
+A strong wrong prior, N(-10, variance 0.01). Far from truth.
+
+```{r priors_wrong, message=FALSE, fig.width=7, fig.height=3}
+M_exp_bad <- joint(
+  formSurv = inla.surv(time, event) ~ trt,
+  dataSurv = simDat, basRisk = "exponentialsurv",
+  control = list(priorFixed = list(mean = -10, prec = 100))
+)
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1), cex = 0.8)
+
+# Baseline Plot
+p1 <- M_exp_bad$marginals.fixed$Intercept_S1
+curve(dnorm(x, -10, 0.1), -15, 15, lwd = 2, ylim = c(0, max(p1[, 2])),
+      main = "Baseline log-rate", xlab = "", ylab = "Density")
+lines(p1, col = 2, lty = 2, lwd = 2)
+abline(v = log(mu_true), col = 4, lty = 3, lwd = 2)
+legend("topright", c("prior", "posterior", "true"),
+       lty = 1:3, col = c(1, 2, 4), lwd = 2, bty = "n", cex = 0.7)
+
+# Treatment Plot
+p2 <- M_exp_bad$marginals.fixed$trt_S1
+curve(dnorm(x, -10, 0.1), -15, 15, lwd = 2, ylim = c(0, max(p2[, 2])),
+      main = "Treatment effect", xlab = "", ylab = "")
+lines(p2, col = 2, lty = 2, lwd = 2)
+abline(v = gamma_true, col = 4, lty = 3, lwd = 2)
+```
+
+[A confident but wrong prior can overcome the data. The posterior misses the truth, with too few events to pull it back.]{style="color: #c55a11;"}
+
+(`plot(model, priors = TRUE)` gives a quick built-in version too.)
+
+## Baseline hazard parameters
+
+Exponential log-rate: a fixed effect. Same Gaussian prior as above.
+
+Weibull shape: a hyperparameter. PC prior. Shrinks toward shape = 1, the exponential.
+
+Random walk precision: PC prior. Reads as P(sigma \> sigma0) = p. Defaults sigma0 = 0.5, p = 0.01.
+
+```{r priors_rw, message=FALSE}
+M_rw2$priors_used$priorRW
+M_rw2_prior <- joint(
+  formSurv = inla.surv(time, event) ~ trt,
+  dataSurv = simDat_w, basRisk = "rw2",
+  control = list(priorRW = c(1, 0.5))
+)
+M_rw2_prior$priors_used$priorRW
+```
+
+Defaults are usually fine here. Hard to hold intuition on a precision.
+
+# Time-dependent covariates and follow-up reconstruction
+
+=\> [Taking advantage of the data augmentation for time-dependent covariates]{style="color: purple;"}
+
+So far, each patient contributed one line to the survival data: a follow-up time and an event indicator. This is convenient, but it hides a useful fact. The same likelihood can also be written as a product of contributions over smaller periods of follow-up.
+
+For a patient followed from time $0$ to time $T_i$, the contribution is
+
+$$L_i = \lambda_i(T_i)^{\delta_i}
+\exp\left\{-\int_0^{T_i} \lambda_i(u)du\right\}.$$
+
+Now split the same follow-up into intervals $[a_{ik}, b_{ik}]$. Each interval has a left-truncation time $a_{ik}$, a right-censoring or event time $b_{ik}$ and an event indicator $d_{ik}$. The product over intervals is
+
+$$\prod_k \lambda_i(b_{ik})^{d_{ik}}
+\exp\left\{-\int_{a_{ik}}^{b_{ik}} \lambda_i(u)du\right\}.$$
+
+The integrals add up to the original integral over $[0,T_i]$, and only the final interval can contain the event. So the one-line format and the multiple-line format carry the same survival information.
+
+This is very useful. Once the data are in interval format, a covariate can change from one interval to the next.
+
+Examples:
+
+- treatment status changes after a switch
+- exposure changes after a hospital visit
+- a lab value is updated at visit times
+- a risk score is recalculated during follow-up
+
+For now, keep the idea practical: a time-dependent covariate is a variable whose value in the risk model can change during follow-up. The interval format gives us one row for each period where the current covariate value applies.
+
+## One line versus several lines
+
+We reuse the Weibull simulation from earlier. First, fit the model in the usual one-line-per-patient format.
+
+```{r}
+M_weib_one <- inla(
+  inla.surv(time, event) ~ trt,
+  data = simDat_w,
+  family = "weibullsurv"
+)
+```
+
+Now decompose each patient's follow-up into 15 intervals. The function `inla.coxph()` creates the same type of interval table that we used for the Poisson approximation.
+
+```{r}
+Itv_weib <- inla.coxph(
+  inla.surv(time, event) ~ trt,
+  data = simDat_w,
+  control.hazard = list(n.intervals = 15)
+)
+
+td_split <- Itv_weib$data
+td_split$start <- td_split$baseline.hazard
+td_split$stop <- td_split$baseline.hazard + td_split$E..coxph
+td_split$mid <- td_split$start + td_split$E..coxph / 2
+```
+
+Look at the first patient in both formats.
+
+```{r}
+cat("Original data for patient 1:\n")
+print(simDat_w[1, c("id", "time", "event", "trt")], row.names = FALSE)
+
+cat("\nExpanded data for patient 1:\n")
+print(head(td_split[td_split$id == simDat_w$id[1],
+                    c("id", "start", "stop", "y..coxph", "trt")], 10),
+      row.names = FALSE)
+```
+
+Each line is a small piece of follow-up. The patient is at risk from `start` to `stop`. The event indicator is 0 for all intervals before the event or censoring time, and 1 only in the final interval if the event is observed.
+
+We can now refit the same Weibull model using left truncation and right censoring on the expanded data.
+
+```{r}
+M_weib_split <- inla(
+  inla.surv(time = td_split$stop,
+            event = td_split$y..coxph,
+            truncation = td_split$start) ~ trt,
+  data = td_split,
+  family = "weibullsurv"
+)
+
+round(rbind(
+  one_line = M_weib_one$summary.fixed["trt", c("mean", "0.025quant", "0.975quant")],
+  split_followup = M_weib_split$summary.fixed["trt", c("mean", "0.025quant", "0.975quant")]
+), 4)
+```
+
+The two estimates match up to numerical precision. We changed the data format, not the survival information.
+
+## Adding a time-dependent covariate
+
+The reward for this data format is that covariates can vary by interval. Here is a simple example where the treatment effect is allowed to differ after year 2.
+
+```{r}
+td_split$after_year2 <- as.integer(td_split$mid > 2)
+td_split$trt_after_year2 <- td_split$trt * td_split$after_year2
+treated_ids <- unique(td_split$id[td_split$trt == 1])
+cured_ids   <- sample(treated_ids, size = round(0.8 * length(treated_ids)))
+td_split$y..coxph[td_split$id %in% cured_ids & td_split$after_year2 == 1] <- 0
+
+M_weib_td <- inla(
+  inla.surv(time = td_split$stop,
+            event = td_split$y..coxph,
+            truncation = td_split$start) ~ trt + trt_after_year2,
+  data = td_split,
+  family = "weibullsurv"
+)
+
+round(M_weib_td$summary.fixed[, c("mean", "0.025quant", "0.975quant")], 4)
+```
+
+Read this model as follows:
+
+- `trt` is the treatment effect before year 2
+- `trt_after_year2` is the extra treatment effect after year 2
+- the sum of both coefficients is the treatment effect after year 2
+
+In real data, we would often choose cutpoints at the times where the covariate is measured or updated. Between two measurement times, the covariate is treated as constant. This is simple, transparent and directly connected to the likelihood.
+
+## Link with the Poisson approximation
+
+This is the same logic used earlier for the Cox-like RW1 and RW2 baselines.
+
+For the Poisson approximation, each interval contributes
+
+$$d_{ik} \sim \text{Poisson}\{y_{ik}\lambda_{0k}\exp(x_{ik}^T\gamma)\}.$$
+
+The event count $d_{ik}$ is usually 0, except in the event interval. The exposure $y_{ik}$ is the time spent in the interval. The covariate vector $x_{ik}$ can now be interval-specific.
+
+This is the practical idea to remember:
+
+1.  Split follow-up into intervals.
+2.  Represent each interval with a start, stop, event indicator and exposure time.
+3.  Let the baseline hazard vary by interval.
+4.  Add covariates that can also vary by interval.
+
+`INLAjoint` uses this structure internally. The random walk prior smooths the interval-specific baseline hazards, and the same expanded data format gives us a natural place to evaluate time-dependent covariates.
+
+# Survival session summary
+
+[The survival-only analysis of the cancer trial did not find a clear treatment difference.]{style="color: #c55a11;"} This is not the end of the story. The next session adds the repeated patient measurements that were collected during follow-up.
+
+[Q]{style="color: purple;"}
