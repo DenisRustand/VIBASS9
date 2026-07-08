@@ -1,0 +1,790 @@
+---
+title: "Longitudinal Data Analysis"
+author: "Denis Rustand"
+date: "July 8 and 9, 2026"
+subtitle: |
+  Bayesian survival, longitudinal and joint models with INLA \
+  VIBASS 9, Valencia, Spain
+output:
+  html_document:
+    toc: false
+    toc_float: false
+    code_folding: show
+    theme: flatly
+    mathjax: default
+  pdf_document:
+    toc: false
+---
+
+```{=html}
+<style>
+pre, pre code {
+  white-space: pre !important;
+  overflow-x: auto !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+</style>
+```
+
+```{r setup, include=FALSE}
+options(width = 200)
+knitr::opts_chunk$set(cache = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+```
+
+```{r, cache=FALSE}
+library(INLA)
+library(INLAjoint)
+library(ggplot2)
+library(ggpubr)
+```
+
+# From survival endpoints to tumor dynamics
+
+The survival analysis used one event time and one event indicator per patient. That is the right scale for mortality, progression and other time-to-event endpoints, but it is not the only information collected in a cancer trial.
+
+During follow-up, clinicians repeatedly image the tumor and record its size. In our simulated trial, the longitudinal marker is **SLD**, the Sum of Longest Diameters of target lesions. Smaller SLD means lower tumor burden.
+
+```{r}
+load("cancer_trial_data.RData")
+survDat$Treatment <- factor(survDat$trt, levels = c(0, 1),
+                            labels = c("B (chemo)", "A (immuno)"))
+longDat$Treatment <- factor(longDat$trt, levels = c(0, 1),
+                            labels = c("B (chemo)", "A (immuno)"))
+head(longDat)
+str(longDat)
+```
+
+Each row is one visit, not one patient.
+
+[The same patient appears on many rows here. Can we treat those rows as independent observations, and what would we get wrong if we did?]{style="color:steelblue;"}
+
+```{r}
+cat("Patients:", length(unique(longDat$id)), "\n")
+cat("Measurements:", nrow(longDat), "\n")
+cat("Median visits per patient:", median(table(longDat$id)), "\n")
+```
+
+## Number of visits
+
+```{r}
+visits_per_patient <- as.data.frame(table(longDat$id))
+names(visits_per_patient) <- c("id", "n_visits")
+
+ggplot(visits_per_patient, aes(x = n_visits)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  labs(x = "Number of visits", y = "Number of patients") +
+  theme_minimal()
+```
+
+Some patients have many measurements, others have few. This is normal in longitudinal data. The model must account for the fact that measurements from the same patient are related.
+
+# Visualizing tumor-size trajectories
+
+## Spaghetti plot
+
+```{r}
+ggplot(longDat, aes(x = time, y = SLD, group = id, color = Treatment)) +
+  geom_line(alpha = 1, linewidth = 1) +
+  labs(x = "Time (years)", y = "Tumor size (SLD)", color = "Treatment") +
+  scale_color_manual(values = c("gray40", "steelblue")) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(longDat, aes(x = time, y = SLD, group = id, color = Treatment)) +
+  geom_line(alpha = 0.14, linewidth = 0.3) +
+  geom_smooth(aes(group = Treatment), method = "loess", se = TRUE, linewidth = 1.2) +
+  labs(x = "Time (years)", y = "Tumor size (SLD)", color = "Treatment") +
+  scale_color_manual(values = c("gray40", "steelblue")) +
+  theme_minimal()
+```
+
+This plot is messy, patients start at different tumor sizes, change at different speeds and stop being observed at different times.
+
+The smooth curves are the first clue. Treatment B appears to have a steeper decline in SLD. These LOESS curves ignore patient heterogeneity.
+
+## A few patients
+
+```{r}
+ids_show <- unique(longDat$id)[1:12]
+
+ggplot(longDat[longDat$id %in% ids_show, ], aes(x = time, y = SLD)) +
+  facet_wrap(~id) +
+  geom_point(size = 1) +
+  geom_line(alpha = 0.6) +
+  labs(x = "Time (years)", y = "SLD") +
+  theme_minimal()
+```
+
+This is the first point: the average trend matters, but individual dynamics matter too. A patient with a large baseline tumor is not interchangeable with a patient whose tumor starts small. A patient whose tumor shrinks quickly is not interchangeable with a patient whose tumor grows.
+
+# Linear regression
+
+As a first pass, we can fit an ordinary linear model. The formula is reasonable: SLD depends on time, treatment and their interaction.
+
+The problem is the independence assumption. `lm()` treats every row as a separate patient. That is statistically invalid here because repeated SLD measurements from the same patient share the same biology, baseline tumor burden and tendency to shrink or grow.
+
+```{r}
+M_lm <- lm(SLD ~ time * trt, data = longDat)
+summary(M_lm)
+```
+
+Same with INLAjoint:
+
+```{r}
+M_lm2 <- joint(formLong = SLD ~ time * trt, 
+               dataLong = longDat, id = "id", timeVar = "time")
+summary(M_lm2) # sdcor=T for std dev instead of variance
+```
+
+The coefficients may look convincing, but the standard errors are based on the wrong unit of information. We have 3581 measurements, but not 3581 independent patients. Mixed-effects models keep the same regression idea while adding patient-specific terms.
+
+=\> [Mixed effects models - from global noise to patient specific variability]{style="color: purple;"}
+
+# Linear mixed-effects models
+
+## Fixed and random effects
+
+The model separates two sources of variation:
+
+- fixed effects: the average tumor-size trajectory in the population
+- random effects: patient-specific deviations around this average
+- residual error: visit-level noise around the patient trajectory
+
+For patient $i$ at visit $j$:
+
+$$Y_{ij} = \eta_i(t_{ij}) + \varepsilon_{ij}.$$
+
+The symbol $\eta_i(t)$ is the patient's underlying trajectory. We never observe it perfectly. We observe noisy measurements around it.
+
+## Random intercept model
+
+First, allow each patient to have their own baseline level:
+
+$$\eta_i(t) = (\beta_0 + b_{i0}) + \beta_1t + \beta_2\text{trt}_i + \beta_3t\text{trt}_i.$$
+
+```{r}
+M_ri <- joint(
+  formLong = SLD ~ time * trt + (1 | id),
+  dataLong = longDat,
+  id = "id",
+  timeVar = "time",
+  control = list(int.strategy = "eb")
+)
+summary(M_ri, sdcor = TRUE)
+```
+
+The random intercept standard deviation tells us how much patients differ at baseline after accounting for treatment and time.
+
+## Individual fits from the random intercept model
+
+```{r}
+pred_ri <- predict(M_ri,
+                   newData = longDat[longDat$id %in% ids_show, ],
+                   horizon = 5, id = "id")
+
+ggplot(pred_ri$PredL, aes(x = time, y = quant0.5)) +
+  facet_wrap(~id) +
+  geom_line(color = "steelblue") +
+  geom_point(data = longDat[longDat$id %in% ids_show, ],
+             aes(x = time, y = SLD), size = 0.8) +
+  labs(x = "Time (years)", y = "SLD",
+       title = "Random intercept model") +
+  theme_minimal()
+```
+
+The fitted lines are shifted up or down by patient, but their slopes remain parallel within treatment arm.
+
+[Is it realistic that every patient changes at the same rate?]{style="color:steelblue;"}
+
+## Random intercept and slope model
+
+Now each patient can also have their own rate of change:
+
+$$\eta_i(t) = (\beta_0 + b_{i0}) + (\beta_1 + b_{i1})t +
+\beta_2\text{trt}_i + \beta_3t\text{trt}_i.$$
+
+```{r}
+M_rs <- joint(
+  formLong = SLD ~ time * trt + (1 + time | id),
+  dataLong = longDat,
+  id = "id",
+  timeVar = "time",
+  control = list(int.strategy = "eb")
+)
+summary(M_rs, sdcor = TRUE)
+```
+
+Now the model estimates a residual standard deviation, a random intercept standard deviation, a random slope standard deviation and their correlation. The `sdcor = TRUE` argument is useful pedagogically: standard deviations and correlations are much easier to interpret than variances and covariances.
+
+The same information can be inspected graphically. `plot()` returns a list of `ggplot2` objects, so we can print the component we want and still modify it with ordinary `ggplot2` syntax if needed.
+
+```{r}
+plot(M_rs)$Outcomes$L1
+```
+
+```{r}
+plot(M_rs, sdcor = TRUE)$Covariances$L1
+```
+
+Bayesian models also require us to remember what we put in before seeing the data. `INLAjoint` stores the default priors used by the model and can overlay prior and posterior distributions in the same plot.
+
+```{r}
+M_rs$priors_used$priorFixed
+```
+
+```{r}
+plot(M_rs, sdcor = TRUE, priors = TRUE)$Covariances$L1
+```
+
+When the posterior is much more concentrated than the prior, the data have been highly informative for that parameter. When prior and posterior remain similar, the data contain little information about that part of the model.
+
+## Priors for the model parameters
+
+Two prior families.
+
+- Fixed effects: Gaussian, mean 0, precision 0.01. Weakly informative. Argument `priorFixed`.
+- Random-effects var-cov: Inverse Wishart. Argument `priorRandom`.
+
+Check what this model used:
+
+```{r}
+M_rs$priors_used$priorFixed
+M_rs$priors_used$priorRandom
+```
+
+Informative data: the prior barely moves the posterior. Weak data: a strong prior can take over.
+
+[If the prior and the posterior land on top of each other for a parameter, what is the data telling us?]{style="color:steelblue;"}
+
+A prior override is only visible when the data are not very informative. Simulate a small set with known random-effect spread, then compare the default prior to a strong one. Red lines are the truth.
+
+```{r}
+set.seed(1)
+n <- 30                                    # few patients
+Sigma <- matrix(c(0.8, 0.2, 0.2, 0.4), 2)  # true RE var-cov: int .8, slope .4, cov .2
+b <- MASS::mvrnorm(n, c(0, 0), Sigma)
+simDat <- do.call(rbind, lapply(seq_len(n), function(i) {
+  t <- sort(runif(4, 0, 2))                # few visits, short follow-up
+  data.frame(id = i, time = t,
+             Y = 3 + b[i, 1] + (-0.5 + b[i, 2]) * t + rnorm(4, 0, 0.6))
+}))
+
+fit_r <- function(r) joint(formLong = Y ~ time + (1 + time | id), dataLong = simDat,
+                           id = "id", timeVar = "time",
+                           control = list(int.strategy = "eb", priorRandom = list(r = r)))
+M_def <- fit_r(3)     # INLAjoint default for 2 RE: r = nRE + 1
+M_inf <- fit_r(100)   # very informative
+
+# truth on the sdcor scale: SDs on the diagonal, correlation off-diagonal
+truth <- data.frame(
+  Effect = unique(plot(M_def, sdcor = TRUE)$Covariances$L1$data$Effect),
+  TrueValues = c(cov2cor(Sigma) + diag(sqrt(diag(Sigma)) - 1)))
+```
+
+Default prior, posterior near the truth:
+
+```{r}
+plot(M_def, sdcor = TRUE, priors = TRUE)$Covariances$L1 +
+  geom_vline(aes(xintercept = TrueValues), data = truth, colour = 2, linetype = 2)
+```
+
+Informative prior (r = 100), posterior pulled toward zero:
+
+```{r}
+plot(M_inf, sdcor = TRUE, priors = TRUE)$Covariances$L1 +
+  geom_vline(aes(xintercept = TrueValues), data = truth, colour = 2, linetype = 2)
+```
+
+Strong priors on random effects are sensitive, so check sensitivity before trusting them.
+
+Prior sensitivity analysis with identifiable / non-identifiable model:
+
+```{r}
+library(JM)
+
+data(pbc2) # dataset
+
+pbc2time05 <- pbc2[c(2,which(diff(as.integer(pbc2$id))==1)+2),]
+pbc2time05 <- pbc2time05[-which(diff(as.integer(pbc2time05$id))==0),]
+pbc2time05$year <- 0.5
+
+pbc2_ni <- rbind(pbc2[c(1,which(diff(as.integer(pbc2$id))==1)+1),], pbc2time05)
+pbc2_ni <- pbc2_ni[order(pbc2_ni$id),]
+
+M1 <- joint(formLong = serBilir ~ year + drug  +  (1 + year|id),
+            dataLong = pbc2, id = "id", timeVar = "year",
+            family = "lognormal", control=list(priorRandom=list(r=10, R=1)))
+
+M2 <- joint(formLong = serBilir ~ year + drug  +  (1 + year|id),
+            dataLong = pbc2, id = "id", timeVar = "year",
+            family = "lognormal", control=list(priorRandom=list(r=100, R=1)))
+
+M3 <- joint(formLong = serBilir ~ year + drug  +  (1 + year|id),
+            dataLong = pbc2_ni, id = "id", timeVar = "year",
+            family = "lognormal", control=list(priorRandom=list(r=10, R=1)))
+
+M4 <- joint(formLong = serBilir ~ year + drug  +  (1 + year|id),
+            dataLong = pbc2_ni, id = "id", timeVar = "year",
+            family = "lognormal", control=list(priorRandom=list(r=100, R=1)))
+
+# plot(M1, priors=TRUE, sdcor=TRUE)$Covariances
+# plot(M2, priors=TRUE, sdcor=TRUE)$Covariances
+# plot(M3, priors=TRUE, sdcor=TRUE)$Covariances
+# plot(M4, priors=TRUE, sdcor=TRUE)$Covariances
+
+A <- plot(M1, priors=TRUE, sdcor=TRUE)$Covariances
+B <- plot(M2, priors=TRUE, sdcor=TRUE)$Covariances
+C <- plot(M3, priors=TRUE, sdcor=TRUE)$Covariances
+D <- plot(M4, priors=TRUE, sdcor=TRUE)$Covariances
+
+A$L1$data <- A$L1$data[which(A$L1$data$Effect=="year_L1:Intercept_L1"), ]
+A$L1$data$Effect <- "Identifiable model, prior 1"
+B$L1$data <- B$L1$data[which(B$L1$data$Effect=="year_L1:Intercept_L1"), ]
+B$L1$data$Effect <- "Identifiable model, prior 2"
+C$L1$data <- C$L1$data[which(C$L1$data$Effect=="year_L1:Intercept_L1"), ]
+C$L1$data$Effect <- "Non-identifiable model, prior 1"
+D$L1$data <- D$L1$data[which(D$L1$data$Effect=="year_L1:Intercept_L1"), ]
+D$L1$data$Effect <- "Non-identifiable model, prior 2"
+
+E <- rbind(A$L1$data, B$L1$data, C$L1$data, D$L1$data)
+
+CorPlots <- ggplot(E, aes(x=x,y=y,group=group)) +
+  xlab('') +
+  ylab('Density') +
+  geom_line(aes(color=group, linetype=group)) +
+  facet_wrap(~Effect, scales='free') + xlim(-1,1) + ylim(0,6.1)
+
+CorPlots
+```
+
+## The treatment by time effect
+
+[The survival model found no clear treatment difference. Would you expect the tumor-size model to agree?]{style="color:steelblue;"}
+
+The treatment difference is mainly in the slope. In `INLAjoint`, the interaction `time:trt` is named `time.X.trt_L1`.
+
+```{r}
+M_rs$summary.fixed["time.X.trt_L1", c("mean", "0.025quant", "0.975quant")]
+```
+
+This is the key longitudinal result. The posterior interval is far from zero. Since `trt = 1` is Treatment A and `trt = 0` is Treatment B, a positive `time:trt` coefficient means the SLD slope is more positive under Treatment A.
+
+Equivalently: [**Treatment B shrinks tumors significantly faster than Treatment A.**]{style="color:orange;"}
+
+This is the first important contrast in the course. The survival-only model did not clearly separate the treatments, while the tumor-size model says that one treatment clearly controls the tumor better.
+
+## Individual fits from the random slope model
+
+```{r}
+pred_rs <- predict(M_rs,
+                   newData = longDat[longDat$id %in% ids_show, ],
+                   horizon = 5, id = "id")
+
+ggplot(pred_rs$PredL, aes(x = time, y = quant0.5)) +
+  facet_wrap(~id) +
+  geom_line(color = "steelblue") +
+  geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975),
+              alpha = 0.2, fill = "steelblue") +
+  geom_point(data = longDat[longDat$id %in% ids_show, ],
+             aes(x = time, y = SLD), size = 0.8) +
+  labs(x = "Time (years)", y = "SLD",
+       title = "Random intercept and slope model") +
+  theme_minimal()
+```
+
+The ribbon above describes uncertainty for the latent patient trajectory, $\eta_i(t)$: the underlying tumor burden after removing residual imaging noise. Sometimes we want prediction uncertainty for a future observed SLD measurement instead. For Gaussian longitudinal outcomes, `resErrLong = TRUE` adds residual error to the prediction distribution.
+
+```{r, fig.height=4}
+one_id <- ids_show[1]
+new_one <- longDat[longDat$id == one_id, ]
+
+pred_latent <- predict(M_rs, newData = new_one, horizon = 5, id = "id")
+pred_observed <- predict(M_rs, newData = new_one, horizon = 5, id = "id",
+                         resErrLong = TRUE)
+
+pred_compare <- rbind(
+  transform(pred_latent$PredL, Target = "Latent trajectory"),
+  transform(pred_observed$PredL, Target = "Future observation")
+)
+
+ggplot(pred_compare, aes(x = time, y = quant0.5)) +
+  geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975),
+              fill = "steelblue", alpha = 0.18) +
+  geom_line(color = "steelblue") +
+  geom_point(data = new_one, aes(x = time, y = SLD), size = 1) +
+  facet_wrap(~Target) +
+  labs(x = "Time (years)", y = "SLD") +
+  theme_minimal()
+```
+
+The second interval is wider because it includes both uncertainty about the true trajectory and the extra residual variation expected in a new measurement.
+
+# Checking whether we need non-linearity
+
+The previous model assumes a linear trajectory. We can add a $t^2$ term in the fixed part for the average trajectory, and in the random part so each patient have their own curvature.
+
+```{r}
+f1 <- function(time) time^2
+
+M_quad <- joint(
+  formLong = SLD ~ (time + f1(time)) * trt + (1 + time | id),
+  dataLong = longDat,
+  id = "id",
+  timeVar = "time",
+  control = list(int.strategy = "eb")
+)
+summary(M_quad)
+```
+
+```{r}
+M_quad$summary.fixed[grep("f1", rownames(M_quad$summary.fixed)),
+                     c("mean", "0.025quant", "0.975quant")]
+```
+
+In this simulated example, the linear model is already enough for the main story. In real studies, we would compare several time functions and keep the model that is both interpretable and well supported by the data.
+
+One common trajectory observed in cancer clinical trials is the J shape where an initial decline is followed by a regrowth due to the development of a resistance to the treatment.
+
+Here is a short example where the curvature is real:
+
+```{r}
+set.seed(2)
+n_q <- 150
+datQuad <- expand.grid(id = 1:n_q, time = 0:4)
+datQuad <- datQuad[order(datQuad$id, datQuad$time), ]
+
+re_int <- rnorm(n_q, 0, 0.9)    # patient starting level
+re_lin <- rnorm(n_q, 0, 0.6)    # patient early slope
+re_qua <- rnorm(n_q, 0, 0.12)   # patient curvature
+
+datQuad$Y <- rnorm(nrow(datQuad),
+  (6 + rep(re_int, each = 5)) +
+  (-2 + rep(re_lin, each = 5)) * datQuad$time +
+  (0.5 + rep(re_qua, each = 5)) * f1(datQuad$time),
+  0.4)
+```
+
+```{r, fig.height=4}
+ggplot(datQuad, aes(x = time, y = Y, group = id)) +
+  geom_line(alpha = 0.12, color = "steelblue") +
+  geom_smooth(aes(group = 1), method = "lm", formula = y ~ poly(x, 2),
+              se = FALSE, color = "black", linewidth = 1.1) +
+  labs(x = "Time", y = "Marker") +
+  theme_minimal()
+```
+
+The average black curve follows a U shape. The patient lines follow this trajectory with individual-specific variations.
+
+The fit keeps the same shape we know, with one extra term for the square of time, in both the fixed and the random part.
+
+```{r}
+M_quad2 <- joint(
+  formLong = Y ~ time + f1(time) + (1 + time + f1(time) | id),
+  dataLong = datQuad,
+  id = "id",
+  timeVar = "time",
+  family = "gaussian",
+  control = list(int.strategy = "eb")
+)
+summary(M_quad2, sdcor = TRUE)
+```
+
+Three fixed effects for the average trajectory. The intercept near 6 is the starting level. The time term near -2 is the early drop. The square term near +0.5 is the bend back up, a positive value means the curve turns upward.
+
+Three random standard deviations capture how far patients start apart, how their early slope varies and how each patient curvature bends. That last one is what a linear model cannot hold.
+
+```{r}
+length(M_quad2$summary.random$IDIntercept_L1$mean) # 3 * N
+length(unique(datQuad$id)) # N
+```
+
+```{r, fig.height=4}
+quad_ids <- order(re_qua)[c(1, 50, 100, 150)]
+new_quad <- datQuad[datQuad$id %in% quad_ids, ]
+
+pred_quad <- predict(M_quad2, newData = new_quad, horizon = 4, id = "id")
+
+ggplot(pred_quad$PredL, aes(x = time, y = quant0.5)) +
+  geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975),
+              fill = "steelblue", alpha = 0.18) +
+  geom_line(color = "steelblue") +
+  geom_point(data = new_quad, aes(x = time, y = Y), size = 1) +
+  facet_wrap(~id) +
+  labs(x = "Time", y = "Marker") +
+  theme_minimal()
+```
+
+Each panel is one patient, and each line is that patient's own curve, not the shared average. The band is the uncertainty on the patient's true mean curve, and the points are their observed marker. Adding "resErrLong=T" to predict gives uncertainty around observations.
+
+- the random square term gives every patient their own curvature
+- a linear model would force one straight slope on all four
+- on the real SLD that straight slope was enough, here it would not be
+
+```{r}
+M_lin <- joint(
+  formLong = SLD ~ time * trt + (1 + time | id),
+  dataLong = longDat,
+  id = "id",
+  timeVar = "time",
+  control = list(int.strategy = "eb")
+)
+
+M_quad <- joint(
+  formLong = SLD ~ (time + f1(time)) * trt + (1 + time | id),
+  dataLong = longDat,
+  id = "id",
+  timeVar = "time",
+  control = list(int.strategy = "eb")
+)
+joint.compare(M_lin, M_quad) # quadraric does not improve upon linear
+
+M_lin2 <- joint(
+  formLong = Y ~ time + (1 + time | id),
+  dataLong = datQuad,
+  id = "id",
+  timeVar = "time",
+  family = "gaussian",
+  control = list(int.strategy = "eb")
+)
+joint.compare(M_lin2, M_quad2) # quadraric does improve upon linear
+```
+
+The test complements WAIC by indicating whether the observed difference is large relative to the noise, where a nonsignificant result means the two models are predictively indistinguishable given the available data, while a significant result indicates a systematic improvement. Because this procedure combines a Bayesian predictive criterion with a frequentist testing framework, the resulting p-values should be interpreted as complementary evidence rather than as a formal Bayesian decision rule.
+
+Sometimes, the statistician can find key information about the data structure that will guide modeling choices with descriptive statistics. Expert knowledge can complement this information (e.g., tumor dynamics in cancer trials where the development of a resistance to treatment can lead to "U" or "J" shape trajectories).
+
+## Going further: a cubic term
+
+The quadratic added one term, `time^2`, in the fixed part for the average shape and in the random part so each patient carries their own curvature. Nothing stops us from going one step further: a cubic term `time^3` lets the average trajectory turn twice, and again every patient gets their own version of it.
+
+```{r, fig.height=4}
+set.seed(4)
+n  <- 150
+datCub <- expand.grid(id = 1:n, time = 0:6)
+datCub <- datCub[order(datCub$id, datCub$time), ]
+
+q1 <- function(time) time^2
+q2 <- function(time) time^3
+
+mu <- 4 + 0.3 * datCub$time * (datCub$time - 4.5)^2
+
+# every patient departs on each term: own level, slope and both curvatures
+re_int <- rnorm(n, 0, 0.9)
+re_lin <- rnorm(n, 0, 0.7)
+re_qua <- rnorm(n, 0, 0.15)
+re_cub <- rnorm(n, 0, 0.02)
+
+datCub$Y <- rnorm(nrow(datCub),
+  mu +
+  re_int[datCub$id] +
+  re_lin[datCub$id] * datCub$time +
+  re_qua[datCub$id] * q1(datCub$time) +
+  re_cub[datCub$id] * q2(datCub$time),
+  0.4)
+
+ggplot(datCub, aes(time, Y, group = id)) +
+  geom_line(alpha = 0.12, color = "steelblue") +
+  labs(x = "Time", y = "Marker") +
+  theme_minimal()
+```
+
+The variability increases over time as each individual has its own trajectory but- there is a shared pattern.
+
+Each term enters both parts of the formula, exactly as the quadratic did.
+
+```{r}
+Mc_quad <- joint(
+  formLong = Y ~ time + q1(time) + (1 + time + q1(time) | id),
+  dataLong = datCub, id = "id", timeVar = "time",
+  family = "gaussian", control = list(int.strategy = "eb")
+)
+
+Mc_cub <- joint(
+  formLong = Y ~ time + q1(time) + q2(time) +
+                 (1 + time + q1(time) + q2(time) | id),
+  dataLong = datCub, id = "id", timeVar = "time",
+  family = "gaussian", control = list(int.strategy = "eb")
+)
+summary(Mc_cub, sdcor = TRUE)
+```
+
+The four random standard deviations show that patients differ not only in level and slope but in both curvatures. The cubic term is the one that lets each curve turn a second time.
+
+A shared helper draws each patient's observed points against the model's fitted trajectory, one panel per patient. We reuse it for every model below.
+
+```{r}
+show_fit <- function(model, sub, horizon) {
+  pr <- predict(model, newData = sub, horizon = horizon, id = "id")
+  ggplot(pr$PredL, aes(time, quant0.5)) +
+    geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975),
+                fill = "steelblue", alpha = 0.18) +
+    geom_line(color = "steelblue") +
+    geom_point(data = sub, aes(time, Y), size = 1) +
+    facet_wrap(~id) +
+    labs(x = "Time", y = "Marker") +
+    theme_minimal()
+}
+```
+
+```{r, fig.height=4}
+sel_c <- order(re_cub)[c(1, 50, 100, 150)]
+sub_c <- datCub[datCub$id %in% sel_c, ]
+show_fit(Mc_cub, sub_c, 6)
+```
+
+```{r}
+joint.compare(Mc_quad, Mc_cub)   # the cubic term is needed
+```
+
+## When polynomials run out
+
+Polynomials work while one global shape describes the whole follow-up. The next example breaks that. It stays low, shifts up over a shared window, then holds high: a change that is local in time, not a single curve stretched across the study.
+
+```{r, fig.height=4}
+set.seed(3)
+n  <- 150
+dat <- expand.grid(id = 1:n, time = 0:8)
+dat <- dat[order(dat$id, dat$time), ]
+
+# shared timing: flat, a rise between t = 2 and t = 6, then flat again
+ramp <- pmin(pmax((dat$time - 2) / 4, 0), 1)
+
+lev   <- rnorm(n, 3, 0.8)     # patient baseline
+amp   <- rnorm(n, 5, 1.0)     # patient rise height (subject-specific shape)
+drift <- rnorm(n, 0, 0.15)    # patient late deviation
+
+dat$Y <- rnorm(nrow(dat),
+  lev[dat$id] + amp[dat$id] * ramp + drift[dat$id] * (dat$time - 4), 0.4)
+
+ggplot(dat, aes(time, Y, group = id)) +
+  geom_line(alpha = 0.10, color = "steelblue") +
+  labs(x = "Time", y = "Marker") +
+  theme_minimal()
+```
+
+We select 4 patients to check the fit:
+
+```{r}
+sel <- order(amp)[c(1, 50, 100, 150)]
+sub <- dat[dat$id %in% sel, ]
+```
+
+Start with linear:
+
+```{r, fig.height=4}
+fit_lin <- joint(
+  formLong = Y ~ time + (1 + time | id),
+  dataLong = dat, id = "id", timeVar = "time",
+  family = "gaussian", control = list(int.strategy = "eb")
+)
+show_fit(fit_lin, sub, 8)   # one straight slope, no plateau
+```
+
+Good rough approximation but lacks flexibility. Let's try adding a quadratic term:
+
+```{r, fig.height=4}
+fit_quad <- joint(
+  formLong = Y ~ time + q1(time) + (1 + time + q1(time) | id),
+  dataLong = dat, id = "id", timeVar = "time",
+  family = "gaussian", control = list(int.strategy = "eb")
+)
+show_fit(fit_quad, sub, 8)   # one bend, still no plateau
+```
+
+Not much better, what happens if we add a cubic term?
+
+```{r, fig.height=4}
+fit_cub <- joint(
+  formLong = Y ~ time + q1(time) + q2(time) +
+                 (1 + time + q1(time) + q2(time) | id),
+  dataLong = dat, id = "id", timeVar = "time",
+  family = "gaussian", control = list(int.strategy = "eb")
+)
+show_fit(fit_cub, sub, 8)   # two bends, but it rounds through both flats
+```
+
+Looking better but uncertainty near the end of follow-up is quite high... Take a moment before reading on. The trend is flat, then rises, then flat again, and the two changes happen at the same times for everyone, around **t = 2** and **t = 6**. Raising the polynomial degree only buys more global wiggle, not a local plateau. How would you let the mean change shape at those two shared times while keeping each patient their own curve?
+
+## What about spline functions?
+
+The data answers it: instead of one curve over the whole window, we let the trend be flexible only where it changes. Natural cubic splines with knots placed at the two change points, `t = 2` and `t = 6`, do exactly this. They enter the formula through the same univariate slots as the powers of time, in the fixed and the random part, so each patient again gets their own curve. The knots are pinned by hand so the fit and any later prediction share the same basis.
+
+```{r}
+library(splines)
+
+# knots at the two change points -> 3 basis columns
+f1 <- function(time) ns(time, knots = c(2, 6), Boundary.knots = c(0, 8))[, 1]
+f2 <- function(time) ns(time, knots = c(2, 6), Boundary.knots = c(0, 8))[, 2]
+f3 <- function(time) ns(time, knots = c(2, 6), Boundary.knots = c(0, 8))[, 3]
+```
+
+```{r}
+fit_spl <- joint(
+  formLong = Y ~ f1(time) + f2(time) + f3(time) +
+                 (1 + f1(time) + f2(time) + f3(time) | id),
+  dataLong = dat, id = "id", timeVar = "time",
+  family = "gaussian", control = list(int.strategy = "eb")
+)
+summary(fit_spl, sdcor = TRUE)
+```
+
+```{r, fig.height=4}
+show_fit(fit_spl, sub, 8)   # flat, rise, flat: all three phases recovered
+```
+
+The comparison closes the story: each polynomial step helps a little, but only the splines match the shape.
+
+```{r}
+joint.compare(fit_lin, fit_quad, fit_cub, fit_spl)
+```
+
+# Population-average trajectories
+
+```{r}
+beta <- setNames(M_rs$summary.fixed[, 1], rownames(M_rs$summary.fixed))
+time_seq <- seq(0, 5, length.out = 100)
+
+beta_0 <- unname(beta["Intercept_L1"])
+beta_time <- unname(beta["time_L1"])
+beta_trt <- unname(beta["trt_L1"])
+beta_time_trt <- unname(beta["time.X.trt_L1"])
+
+df_pop <- data.frame(
+  time = rep(time_seq, 2),
+  trt = rep(c(0, 1), each = length(time_seq))
+)
+
+df_pop$Treatment <- factor(df_pop$trt, levels = c(0, 1),
+                           labels = c("B (chemo)", "A (immuno)"))
+df_pop$SLD <- beta_0 + beta_time * df_pop$time +
+  beta_trt * df_pop$trt + beta_time_trt * df_pop$time * df_pop$trt
+
+ggplot(df_pop, aes(x = time, y = SLD, color = Treatment)) +
+  geom_line(linewidth = 1.2) +
+  labs(x = "Time (years)", y = "SLD",
+       title = "Population-average tumor trajectories") +
+  scale_color_manual(values = c("gray40", "steelblue")) +
+  theme_minimal()
+```
+
+The longitudinal analysis tells us how tumor size evolves over time and how that evolution differs by treatment arm. [Treatment B has the better SLD trajectory.]{style="color:orange;"}
+
+[Is that enough to call B the better treatment?]{style="color:steelblue;"}
+
+# Where this leaves us
+
+We now have two correct analyses of the same trial, but they point in different directions:
+
+| Analysis                 | Main message                         |
+|:-------------------------|:-------------------------------------|
+| Survival-only model      | no clear overall survival difference |
+| Longitudinal mixed model | Treatment B shrinks tumors faster    |
+
+**Treatment B shrinks tumors faster, but does not save more lives in the survival analysis?**
+
+At this point, we know how to model a marker trajectory as its own outcome. Keep that idea separate for now: we have not yet modeled how the trajectory and the event endpoint should speak to each other.
+
+[Q]{style="color: purple;"}
