@@ -1,0 +1,258 @@
+---
+title: "Introduction to R-INLA and INLAjoint"
+author: "Denis Rustand"
+date: "July 8 and 9, 2026"
+subtitle: |
+  Bayesian survival, longitudinal and joint models with INLA \
+  VIBASS 9, Valencia, Spain
+output:
+  html_document:
+    toc: false
+    toc_float: false
+    theme: flatly
+    mathjax: default
+  pdf_document:
+    toc: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+```
+
+## The R package INLA (R-INLA)
+
+The `R-INLA` package implements the Integrated Nested Laplace Approximations methodology in R. It computes approximate posterior density functions for latent Gaussian models.
+
+The interface is very general. It offers robust capabilities for advanced models but it requires specific knowledge and coding skills to specify complex structures.
+
+### Installation
+
+You can install the package directly from the repository:
+
+```{r eval=FALSE}
+install.packages("INLA", 
+                 repos=c(getOption("repos"),
+                        INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+```
+
+### The inla() function
+
+The main function to fit a model is `inla()`. It requires three main arguments: `formula`, `data` and `family`.
+
+Fixed effects are added with `+`. Random effects are specified using the `f()` function.
+
+Here is a conceptual example for a logistic regression with a random intercept:
+
+```{r}
+library(INLA)
+load("data_example.RData")
+result_inla <- inla(y ~ x1 + x2 + f(ID, model = "iid"),
+                    data = data_example, family = "binomial")
+```
+
+### Extracting results
+
+The fitted object contains posterior summaries and densities for all parameters.
+
+```{r}
+summary(result_inla)
+```
+
+You can extract the posterior summaries of the fixed effects:
+
+```{r}
+result_inla$summary.fixed
+```
+
+You can extract the exact marginal posterior densities (a data frame of x and y coordinates mapping the density):
+
+```{r}
+result_inla$marginals.fixed
+```
+
+You can plot these densities directly:
+
+```{r}
+plot(result_inla$marginals.fixed$x1, type = "l")
+```
+
+For random effects or hyperparameters, you simply replace `fixed` with `random`, `hyperpar`, `fitted.values` or `linear.predictor`.
+
+### Finding documentation internally
+
+INLA supports a massive number of likelihoods and latent models. You can explore them directly in the R console:
+
+```{r}
+# List all available likelihood families
+names(inla.models()$likelihood)
+
+# Read documentation for a specific likelihood
+inla.doc("zeroinflatedpoisson")
+
+# List all available latent models for the f() function
+names(inla.models()$latent)
+
+# List available priors
+names(inla.models()$prior)
+```
+
+## The R package INLAjoint
+
+To address the coding complexity of `R-INLA` for multiple outcomes, the `INLAjoint` package was developed. It provides a user interface tailored for survival, longitudinal and joint data analysis.
+
+It replaces error-prone coding with an intuitive framework. It also includes post-processing functions to extract predictions, hazard ratios and survival probabilities easily.
+
+### Installation
+
+`INLAjoint` is available on CRAN:
+
+```{r eval=FALSE}
+install.packages("INLAjoint")
+```
+
+The development version is available on GitHub:
+
+```{r eval=FALSE}
+devtools::install_github("DenisRustand/INLAjoint")
+```
+
+### The joint() function
+
+The primary model-fitting function is `joint()`. It uses a building blocks syntax.
+
+```{r eval=FALSE}
+joint(
+  formSurv = NULL, formLong = NULL, dataSurv = NULL, dataLong = NULL,
+  id = NULL, timeVar = NULL, family = "gaussian", link = "default",
+  basRisk = "rw1", NbasRisk = 15, cutpoints = NULL, assoc = NULL,
+  assocSurv = NULL, corLong = FALSE, corRE = TRUE, dataOnly = FALSE,
+  longOnly = FALSE, silentMode = FALSE, reorder = TRUE, run = TRUE, 
+  control = list()
+)
+```
+
+Missing values in the outcomes are handled automatically. INLA replaces them with their posterior mean during the fitting process. Missing values in covariates are not allowed.
+
+### Important control options
+
+The `control` argument allows you to tune the fitting procedure:
+
+- `int.strategy`: The numerical integration strategy for hyperparameters. Options include `"auto"`, `"ccd"`, `"grid"` and `"eb"`. We often use `"eb"` (empirical Bayes) to speed up computations without degrading frequentist properties.
+- `safemode`: A boolean (default TRUE) that automatically reruns the model with adjusted starting values if it detects instability.
+- `run`: A boolean (default TRUE). If set to FALSE, the function builds the model structure but does not run the INLA algorithm. This "build only" option allows you to manually modify priors or structures before fitting.
+
+## A quick tour of INLAjoint outputs
+
+We will detail the math behind survival, longitudinal and joint models in the upcoming sessions. For now, let's fit a complex model just to see how `INLAjoint` handles syntax, outputs and plotting.
+
+We use the `pbc2` dataset. We model two longitudinal markers (SGOT and platelets) and one survival outcome (death).
+
+```{r message=FALSE, warning=FALSE}
+library(INLA)
+library(INLAjoint)
+library(JMbayes2) # Contains the pbc2 data
+
+data("pbc2.id")
+data("pbc2")
+```
+
+We fit the model by providing lists of formulas:
+
+```{r message=FALSE, warning=FALSE, cache=TRUE}
+IJ <- joint(formSurv = list(inla.surv(years, status2) ~ drug),
+            formLong = list(SGOT ~ year * drug + (1|id),
+                            platelets ~ year * drug + (1|id)),
+            dataLong = pbc2, dataSurv = pbc2.id, id = "id",
+            timeVar = "year", corLong = TRUE, basRisk = "weibullsurv",
+            family = c("lognormal", "poisson"), assoc = c("CV", "CV"),
+            control = list(int.strategy = "eb"))
+```
+
+### The summary function
+
+The `summary` function returns results grouped by outcome.
+
+Of note, adding `sdcor = TRUE` displays standard deviations and correlations instead of variances and covariances. Adding `hr = TRUE` automatically converts survival fixed effects into hazard ratios.
+
+```{r}
+summary(IJ)
+```
+
+```{r}
+summary(IJ, sdcor = TRUE, hr = TRUE)
+```
+
+### The plot function
+
+The `plot()` function returns a list of `ggplot2` objects covering all model parameters. You can add `priors = TRUE` to visually inspect how the data updated your prior beliefs.
+
+```{r}
+# Plot fixed effects for the first longitudinal outcome
+plot(IJ)$Outcomes$L1
+```
+
+```{r}
+# Plot fixed effects for the first longitudinal outcome with priors
+plot(IJ, priors=TRUE)$Outcomes$L1
+```
+
+```{r}
+# Plot variance and covariance of random effects (with priors)
+plot(IJ)$Covariances$L1
+```
+
+```{r}
+# Plot standard deviations and correlations of random effects
+plot(IJ, sdcor=TRUE)$Covariances$L1
+```
+
+```{r}
+# Plot standard deviations and correlations of random effects with priors
+plot(IJ, sdcor = TRUE, priors = TRUE)$Covariances$L1
+```
+
+### The predict function
+
+The `predict()` function turns the fitted model into a dynamic tool for patient-specific predictions. It handles the integration over random effects automatically.
+
+Let's create a new dataset for the first 6 patients to predict their future profiles.
+
+```{r}
+NewData <- pbc2[pbc2$id %in% 1:6, c("id", "drug", "year", "SGOT", "platelets")];NewData
+```
+
+We predict up to year 14. We apply the inverse link function to get predictions on the scale of the observed data and we assume patients were at risk of the event starting at year 1.
+
+```{r message=FALSE, warning=FALSE, cache=TRUE}
+P <- predict(IJ, NewData, horizon = 9:14, id = "id", 
+             survival = TRUE, inv.link = TRUE, Csurv = 1)
+```
+
+We can plot the predicted longitudinal counts for platelets:
+
+```{r}
+library(ggplot2)
+ggplot(P$PredL[P$PredL$Outcome == "platelets", ], aes(x = year, y = quant0.5)) + 
+  facet_wrap(~id) +
+  geom_line() + xlab("Time") + ylab("Platelets counts") +
+  geom_line(aes(y = quant0.025), linetype = "dotted") +
+  geom_line(aes(y = quant0.975), linetype = "dotted") +
+  geom_point(data = NewData, aes(x = year, y = platelets)) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+We can also plot their dynamically updated survival probabilities:
+
+```{r}
+ggplot(P$PredS, aes(x = year, y = Surv_quant0.5)) + 
+  facet_wrap(~id) +
+  geom_line() + xlab("Time") + ylab("Survival probability") +
+  geom_line(aes(y = Surv_quant0.025), linetype = "dotted") +
+  geom_line(aes(y = Surv_quant0.975), linetype = "dotted") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+Now that we understand the software mechanics and how to extract information, we can introduce survival analysis.
+
+[Q]{style="color: purple;"}

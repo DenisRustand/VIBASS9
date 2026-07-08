@@ -15,6 +15,8 @@ subtitle: |
 
 Running the code during the course is **optional**. If you want to run the code, please complete the following steps **before the course**. Installing packages can take time, so do not leave this for the last minute.
 
+GITHUB : <https://github.com/DenisRustand/VIBASS9>
+
 ## R version
 
 You need **R \>= 4.6**. Check with:
@@ -76,3 +78,4 @@ inla.binary.install()
 - **Linux users**: you may need system libraries `libudunits2-dev`, `libgdal-dev`, `libgeos-dev`, `libproj-dev`, `libsqlite3-dev` and `libgsl-dev`.
 - **Mac users**: make sure Xcode command line tools are installed (`xcode-select --install`)
 - **Windows users**: Rtools may be required for some packages
+
