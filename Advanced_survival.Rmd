@@ -1,0 +1,534 @@
+---
+title: "Advanced survival"
+author: "Denis Rustand"
+date: "July 8 and 9, 2026"
+subtitle: |
+  Bayesian survival, longitudinal and joint models with INLA \
+  VIBASS 9, Valencia, Spain
+output:
+  html_document:
+    toc: false
+    toc_float: false
+    code_folding: show
+    theme: flatly
+    mathjax: default
+  pdf_document:
+    toc: false
+---
+
+```{=html}
+<style>
+pre, pre code {
+  white-space: pre !important;
+  overflow-x: auto !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+</style>
+```
+
+```{r setup, include=FALSE}
+options(width = 200)
+knitr::opts_chunk$set(cache = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 6, fig.align = "center")
+```
+
+# Beyond a single event time
+
+The survival models seen so far describe one event on one timeline. Real studies are often more complex.
+
+The event can have several distinct causes. The disease can move through stages instead of jumping straight to the terminal event. Patients can be grouped in centers, or can experience the same event many times.
+
+Each of these situations needs a model that a single-event survival fit cannot give. We look at four extensions, each introduced from the point where a simpler model reaches its limit:
+
+- competing risks, when an event can happen for one of several mutually exclusive causes
+- multi-state models, when patients pass through intermediate states
+- frailty models, when observations are clustered or repeated
+- shared frailty joint models, when two event processes share hidden risk
+
+```{r, cache=FALSE}
+library(INLA)
+library(INLAjoint)
+library(ggplot2)
+library(ggpubr)
+library(survival)
+```
+
+```{r}
+# survDat: one row per patient, with death time, death indicator and treatment.
+# trt = 1 is Treatment A (immuno), trt = 0 is Treatment B (chemo).
+load("cancer_trial_data.RData")
+```
+
+------------------------------------------------------------------------
+
+# Competing risks
+
+In the trial, death was the single terminal event. Suppose we now split death into two causes: death from the cancer and death from any other cause.
+
+If the question is the risk of dying from the cancer, a single-cause model treats every other-cause death as a censored observation. But censoring has a precise meaning. It says the patient could still have the event later, we just stopped watching.
+
+That meaning is false here. A patient who has died from another cause can never die from the cancer.
+
+So treating other-cause death as plain censoring overstates the risk of cancer death. The usual `1 - KM` curve climbs too high, because it credits those patients with a cancer death that can no longer happen.
+
+Competing risks handle this. Each cause has its own hazard, and an event from one cause removes the patient from the risk set of the others.
+
+*If a patient dies from another cause, can they still die from the cancer afterward?*
+
+No. The two causes block each other. This is why a competing event is not the same as censoring, and why the probability of cancer death has to account for the chance of dying from something else first.
+
+$$\lambda_i(t) = \lambda_{0}(t)\exp\{x_i(t)^T\gamma\}.$$
+
+For cause $k$, the cause-specific hazard is the instantaneous rate of cause $k$ among patients still free of any event just before time $t$. With two causes we fit two of them:
+
+$$\lambda_i^{\text{cancer}}(t), \qquad
+\lambda_i^{\text{other}}(t).$$
+
+We add an other-cause death time to the trial. This background mortality does not depend on the cancer treatment.
+
+```{r}
+set.seed(2)
+n_cr <- nrow(survDat)
+
+# Background (other-cause) death time, drawn from a constant rate, no treatment effect.
+other_rate <- 0.06
+other_times <- -log(runif(n_cr)) / other_rate
+
+# The observed event is the first of cancer death, other-cause death or follow-up end (5).
+event_time_cr <- pmin(survDat$deathTimes, other_times, 5)
+
+# Cancer death: the trial's own death process, if it comes first and within follow-up.
+cancerDeath <- as.integer(survDat$death == 1 &
+                            survDat$deathTimes <= other_times &
+                            survDat$deathTimes <= 5)
+
+# Other-cause death: if the background death comes first and within follow-up.
+otherDeath <- as.integer(other_times < survDat$deathTimes & other_times <= 5)
+
+crDat <- data.frame(
+  id = survDat$id,
+  eventTime = round(event_time_cr, 4),
+  cancerDeath = cancerDeath,   # cause 1 indicator
+  otherDeath = otherDeath,     # cause 2 indicator
+  trt = survDat$trt
+)
+
+cat("Cancer deaths:", sum(crDat$cancerDeath))
+cat("Other-cause deaths:", sum(crDat$otherDeath))
+cat("Censored:", sum(crDat$cancerDeath == 0 & crDat$otherDeath == 0))
+```
+
+A competing risks model is a list of cause-specific formulas. The first is the cancer-death hazard, the second is the other-cause hazard. Both share the event time and read a different cause indicator. `INLAjoint` does the internal data expansion that lets two likelihoods sit under one fit.
+
+```{r, cache=TRUE}
+M_cr <- joint(
+  formSurv = list(
+    inla.surv(eventTime, cancerDeath) ~ trt,   # cause-specific hazard, cancer death
+    inla.surv(eventTime, otherDeath) ~ trt     # cause-specific hazard, other-cause death
+  ),
+  dataSurv = crDat,
+  basRisk = "rw2",                             # smooth semi-parametric baseline
+  id = "id",
+  control = list(int.strategy = "eb")          # fast empirical-Bayes integration
+)
+
+cr_effects <- summary(M_cr, hr = TRUE)$SurvEff  # hr = TRUE prints hazard ratios
+cr_effects
+```
+
+The first row is the treatment effect on cancer death, a cause-specific hazard ratio among patients still alive. The second row is the treatment effect on other-cause death, near 1 here since the background mortality was simulated without a treatment effect.
+
+A cause-specific hazard ratio below 1 means a lower instantaneous rate for that cause among the patients still at risk. This is a rate, not yet a probability of death by a given time.
+
+## CIF against survival
+
+The probability scale comes from the cumulative incidence function. For cause $k$,
+
+$$F_k(t \mid x) = P(T \leq t, D = k \mid x)
+= \int_0^t S(u \mid x) \lambda_k(u \mid x)\,du,$$
+
+where
+
+$$S(t \mid x) = \exp\left\{-\sum_k \Lambda_k(t \mid x)\right\}$$
+
+is the probability of no event of any cause up to time $t$. The pieces add up:
+
+- $S(t)$ is event-free survival, alive and free of both causes before $t$
+- $F_{\text{cancer}}(t)$ is the probability that cancer death is the first event before $t$
+- $F_{\text{other}}(t)$ is the probability that other-cause death is the first event before $t$
+- $S(t) + F_{\text{cancer}}(t) + F_{\text{other}}(t) = 1$
+
+=\> instead of asking "what is the probability of dying from cancer in a world where I can only die from cancer?" we ask "what is the probability of dying from cancer in a world where I can also die from other causes?"
+
+Ignoring a competing risk can severely bias the analysis!
+
+*A cause-specific hazard ratio for cancer death is near 1 but the cumulative incidence of cancer death still differs between the arms. How?*
+
+Because the incidence of one cause depends on the hazard of the other cause too. If one arm dies faster from other causes, fewer of its patients remain at risk to die from cancer, so its cancer-death incidence shifts even when its own cancer hazard is unchanged. The hazard answers a rate question, the CIF answers a probability question.
+
+```{r, cache=TRUE}
+# Two reference patients at time zero, one per arm.
+NewCR <- data.frame(id = c(1, 2), eventTime = c(0, 0),
+                    cancerDeath = c(0, 0), otherDeath = c(0, 0),
+                    trt = c(0, 1))
+
+# CIF = TRUE asks predict() for cumulative incidence, the probability scale.
+P_cr <- predict(M_cr, newData = NewCR, horizon = 5, CIF = TRUE, id = "id")
+```
+
+```{r}
+df_cr <- P_cr$PredS
+# id 1 was trt = 0 (B chemo), id 2 was trt = 1 (A immuno).
+df_cr$Treatment <- factor(ifelse(as.character(df_cr$id) == "1",
+                                 "B (chemo)", "A (immuno)"))
+# Outcome S_1 is the first formula (cancer death), S_2 the second (other cause).
+df_cr$Event <- ifelse(grepl("S_1", df_cr$Outcome),
+                      "Cancer death", "Other-cause death")
+
+ggplot(df_cr, aes(x = eventTime, y = CIF_quant0.5,
+                  color = Treatment, fill = Treatment)) +
+  facet_wrap(~Event) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = CIF_quant0.025, ymax = CIF_quant0.975),
+              alpha = 0.15, color = NA) +
+  labs(x = "Time", y = "Cumulative incidence") +
+  ylim(0, 1) + theme_minimal()
+```
+
+These curves answer direct probability questions. By year 5, what is the probability a patient has died from the cancer, and what is the probability a patient has died from another cause. The bands are credible intervals, so the uncertainty reads straight off the plot.
+
+```{r}
+# Total first-event probability is the sum of the two cause CIFs.
+# Event-free probability is whatever is left.
+cr_total <- aggregate(CIF_quant0.5 ~ id + eventTime + Treatment,
+                      data = df_cr, sum)
+cr_total$event_free <- pmax(0, 1 - cr_total$CIF_quant0.5)
+
+cr_final <- cr_total[cr_total$eventTime == max(cr_total$eventTime), ]
+cr_final[, c("CIF_quant0.5", "event_free")] <-
+  round(cr_final[, c("CIF_quant0.5", "event_free")], 3)
+cr_final[, c("Treatment", "eventTime", "CIF_quant0.5", "event_free")]
+```
+
+The `CIF_quant0.5` column is the total probability of having died from either cause by that time. The `event_free` column is the remaining probability of being alive. The two sum to one within each arm, the accounting that `1 - KM` would have broken.
+
+------------------------------------------------------------------------
+
+# Multi-state models
+
+Competing risks describe the first event and then stop. Suppose we keep watching after it.
+
+A patient often progresses before dying. Progression does not end the story, it changes the risk. A patient who has progressed is still alive, and usually faces a higher risk of death than before.
+
+A model with death as a single endpoint cannot see this. It records the death but ignores that the patient passed through progression on the way, and that the death risk changed at that point.
+
+The multi-state model follows the whole path. For an illness-death model:
+
+- State 1: alive without progression
+- State 2: alive after progression
+- State 3: dead
+
+The moves are $1 \to 2$ (progression), $1 \to 3$ (death without progression) and $2 \to 3$ (death after progression). Each move has its own hazard,
+
+$$\lambda_{12}(t), \qquad \lambda_{13}(t), \qquad \lambda_{23}(t).$$
+
+State probabilities are a different object. Hazards are instantaneous rates. State probabilities answer questions such as the probability that a patient is alive without progression at year 3. They follow the transition system
+
+$$\frac{d}{dt}
+\begin{pmatrix}
+p_1(t) & p_2(t) & p_3(t)
+\end{pmatrix}
+=
+\begin{pmatrix}
+p_1(t) & p_2(t) & p_3(t)
+\end{pmatrix}
+\begin{pmatrix}
+-(\lambda_{12} + \lambda_{13}) & \lambda_{12} & \lambda_{13} \\
+0 & -\lambda_{23} & \lambda_{23} \\
+0 & 0 & 0
+\end{pmatrix}.$$
+
+*A patient is only at risk of death-after-progression once they progress. From what time should we count their risk for that move?*
+
+From the progression time, not from study entry. Counting from entry would credit them with at-risk time during which the move was impossible. The `truncation` argument sets the entry time for that risk period.
+
+We simulate a progression time, then a death time after progression. The first two moves come from the same first-event data, the third move is left truncated at progression.
+
+```{r}
+set.seed(3)
+n_ms <- nrow(survDat)
+
+# Progression time. gamma_prog = -0.20 makes treatment A (trt = 1) progress slower.
+prog_rate <- 0.30
+gamma_prog <- -0.20
+prog_times <- -log(runif(n_ms)) / (prog_rate * exp(gamma_prog * survDat$trt))
+
+# First event out of state 1: progression, death or follow-up end (5).
+event_time_ms <- pmin(survDat$deathTimes, prog_times, 5)
+progressed <- as.integer(prog_times < survDat$deathTimes & prog_times <= 5)
+diedFirst  <- as.integer(survDat$death == 1 &
+                           survDat$deathTimes <= prog_times &
+                           survDat$deathTimes <= 5)
+
+# Move 1 to 2 (progression) and move 1 to 3 (death without progression).
+msDat12 <- data.frame(id = survDat$id, eventTime = round(event_time_ms, 4),
+                      event = progressed, trt = survDat$trt)
+msDat13 <- data.frame(id = survDat$id, eventTime = round(event_time_ms, 4),
+                      event = diedFirst, trt = survDat$trt)
+
+# Move 2 to 3: only patients who progressed are ever at risk.
+set.seed(4)
+prog_ids  <- survDat$id[progressed == 1]
+prog_time <- event_time_ms[progressed == 1]
+prog_trt  <- survDat$trt[progressed == 1]
+
+# Post-progression death from the progression time onward (exp(-0.30 * trt): A dies slower).
+post_prog_death <- prog_time + rexp(length(prog_ids), 0.40 * exp(-0.30 * prog_trt))
+post_prog_death <- pmin(post_prog_death, 5)
+
+msDat23 <- data.frame(
+  id = prog_ids,
+  eventStart = prog_time,                  # entry time into the at-risk period
+  eventTime = round(post_prog_death, 4),
+  event = as.integer(post_prog_death < 5),
+  trt = prog_trt
+)
+
+cat("Transition 1 to 2:", sum(msDat12$event), "\n")
+cat("Transition 1 to 3:", sum(msDat13$event), "\n")
+cat("Transition 2 to 3:", sum(msDat23$event), "\n")
+```
+
+Each transition gets its own formula. A covariate can appear in one transition and not in another. The third formula carries the `truncation` argument that encodes delayed entry.
+
+```{r, cache=TRUE}
+M_ms <- joint(
+  formSurv = list(
+    inla.surv(eventTime, event) ~ trt,                              # 1 to 2
+    inla.surv(eventTime, event) ~ trt,                              # 1 to 3
+    inla.surv(eventTime, event, truncation = eventStart) ~ trt      # 2 to 3, left truncated
+  ),
+  dataSurv = list(msDat12, msDat13, msDat23),
+  id = "id",
+  basRisk = "rw2",                       # one smooth baseline per transition
+  control = list(int.strategy = "eb")
+)
+
+summary(M_ms, hr = TRUE)$SurvEff
+```
+
+Three transitions give three treatment effects, which is the whole reason to prefer this model over a single endpoint:
+
+- `trt_S1`, effect on progression, the $1 \to 2$ move. Simulated to favor A.
+- `trt_S2`, effect on death without progression, the $1 \to 3$ move. From the trial's death process.
+- `trt_S3`, effect on death after progression, the $2 \to 3$ move. Simulated to favor A.
+
+The same treatment can lower the progression hazard and behave differently once a patient has progressed. A single composite endpoint averages these three stories into one number and hides the stage-specific effect.
+
+State-occupancy probabilities (alive and progression-free, alive after progression, dead) can be derived from the transition hazards returned by `predict`. For a sequence of transitions, a finer grid of baseline intervals helps the late $2 \to 3$ hazard, for example `cutpoints = seq(0, 5, length.out = 50)` passed to `joint()`. The extra intervals cost only computation time.
+
+------------------------------------------------------------------------
+
+# Frailty models
+
+The models so far assume patients are independent once we know their covariates. Suppose the patients are grouped, for example enrolled across many centers.
+
+Centers differ in ways we do not measure: care quality, equipment, local patient mix. Two patients on the same arm but in different centers do not share the same background risk.
+
+Ignoring this has two costs. The treatment effect can be biased, and its precision is overstated, because correlated patients are counted as if independent.
+
+A frailty term adds a random effect to the hazard, shared by all patients in a center. It is a random intercept on the log-hazard, and it absorbs the between-center spread that the covariates leave behind.
+
+$$\lambda_i(t) = \lambda_0(t)\exp(\gamma \cdot \text{trt}_i + v_{g(i)}),
+\qquad v_g \sim N(0, \sigma_v^2).$$
+
+*With a center frailty in the model, what does the treatment hazard ratio now compare?*
+
+Two patients in the same center. The center spread has been taken out of the comparison, so the effect is within-center rather than population-average.
+
+We build an illustrative multi-center dataset: 500 patients over 50 centers, each center carrying its own hidden risk shift.
+
+```{r}
+set.seed(5)
+n_f <- 500
+n_centers <- 50
+center <- rep(1:n_centers, each = n_f / n_centers)
+
+# One latent risk shift per center, sigma_v = 5 is its spread.
+sigma_v <- 5
+center_effect <- rnorm(n_centers, 0, sigma_v)
+v_i <- center_effect[center]
+trt_f <- rbinom(n_f, 1, 0.5)
+
+# Hazard carries treatment (-0.50, so trt = 1 lowers risk) plus the center shift.
+event_times_f <- -log(runif(n_f)) / (0.20 * exp(-0.50 * trt_f + v_i))
+censor_times_f <- runif(n_f, 0, 5)
+
+frailtyDat <- data.frame(
+  id = 1:n_f,
+  time = pmin(event_times_f, censor_times_f),
+  event = as.integer(event_times_f <= censor_times_f),
+  trt = trt_f,
+  center = center
+)
+```
+
+Ignoring the centers first, we find no significant treatment effect:
+
+```{r, cache=TRUE}
+M_frailty0 <- joint(
+  formSurv = inla.surv(time, event) ~ trt,
+  dataSurv = frailtyDat,
+  id = "center",
+  basRisk = "rw2",
+  control = list(int.strategy = "eb")
+)
+
+summary(M_frailty0, hr = TRUE)
+```
+
+The frailty enters the formula as `(1 | center)`. The grouping variable also becomes the `id`.
+
+```{r, cache=TRUE}
+M_frailty <- joint(
+  formSurv = inla.surv(time, event) ~ trt + (1 | center),  # random center intercept on the hazard
+  dataSurv = frailtyDat,
+  id = "center",
+  basRisk = "rw2",
+  control = list(int.strategy = "eb")
+)
+
+summary(M_frailty, sdcor = TRUE, hr = TRUE)   # sdcor prints the frailty as a standard deviation
+```
+
+Reading the output:
+
+- the treatment hazard ratio is conditional on center frailty, a within-center comparison. Treatment was simulated at -0.50 on the log-hazard, so a ratio near 0.6.
+- the frailty standard deviation measures residual center spread, simulated at 5.
+- a positive center frailty means higher event risk for everyone in that center.
+- a larger standard deviation means centers differ more in baseline risk, and ignoring that spread gives a falsely confident treatment effect.
+
+```{r}
+M_frailty$summary.random$IDIntercept_S1   # frailty of the 50 centers
+```
+
+The same frailty structure handles recurrent events, where one patient contributes several event times. It also combines with time-dependent covariates: split each patient's follow-up into intervals, attach the current covariate value to each interval and keep the frailty in the formula.
+
+------------------------------------------------------------------------
+
+# Shared frailty joint model
+
+A frailty can do more than absorb clustering. It can link two event processes.
+
+Suppose patients have a recurrent event, repeated hospitalizations or repeated new lesions, and also a terminal event, death. A patient with high unobserved risk for the recurrent event often has high unobserved risk of death too.
+
+Two separate models cannot see this link. Worse, the recurrent process is stopped by death, so analyzing it alone treats death as ordinary censoring. That censoring is informative and biases the recurrent-event estimates.
+
+The shared frailty joint model fits both processes together. One latent risk per patient enters both hazards, scaled by a parameter that measures how strongly the two are tied.
+
+$$\begin{aligned}
+\lambda_{i1}(t) &= \lambda_{01}(t)\exp\{\gamma_1 \text{trt}_i + u_i\}, \\
+\lambda_{i2}(t) &= \lambda_{02}(t)\exp\{\gamma_2 \text{trt}_i + \varphi\, u_i\}, \\
+u_i &\sim N(0, \sigma_u^2).
+\end{aligned}$$
+
+The parameter $\varphi$ is the link. If $\varphi > 0$, a patient with a higher recurrent-event frailty also carries a higher death hazard. If $\varphi = 0$, the two processes share no residual risk once treatment is accounted for.
+
+*The recurrent-event process is stopped when a patient dies. Why is it a problem to analyze the recurrent events on their own?*
+
+Because death is not ordinary censoring here. Patients who die tend to be those with more recurrent events, so dropping them at death removes the high-risk cases in a way that depends on the outcome. Fitting both processes together lets the terminal event inform the recurrent one.
+
+The recurrent is built in counting-process format, one row per at-risk interval. The terminal is one row per patient.
+
+```{r}
+set.seed(6)
+n_sf <- 500
+trt_sf <- rbinom(n_sf, 1, 0.5)
+
+# One shared latent risk per patient, sigma_shared = 0.5
+sigma_shared <- 0.5
+shared_risk <- rnorm(n_sf, 0, sigma_shared)
+
+# Terminal: death depends on treatment (-0.35) and the shared risk (0.80).
+terminal_rate <- 0.12 * exp(-0.35 * trt_sf + 0.80 * shared_risk)
+terminal_time <- rexp(n_sf, terminal_rate)
+censor_time <- runif(n_sf, 3, 6)
+follow_time <- pmin(terminal_time, censor_time)
+death_sf <- as.integer(terminal_time <= censor_time)
+
+# Recurrent: walk each patient's timeline, one row per interval.
+recurrent_rows <- vector("list", n_sf)
+for(i in seq_len(n_sf)){
+  recurrent_rate <- 0.45 * exp(-0.25 * trt_sf[i] + shared_risk[i])
+  start <- 0
+  rows_i <- list()
+  row_id <- 1
+
+  repeat{
+    stop <- start + rexp(1, recurrent_rate)
+    if(stop < follow_time[i]){
+      # interval ending in a recurrence (recurrent = 1)
+      rows_i[[row_id]] <- data.frame(
+        id=i, tstart=start, tstop=stop,
+        recurrent=1, trt=trt_sf[i]
+      )
+      start <- stop
+      row_id <- row_id + 1
+    }else{
+      # final interval, ending in censoring at end of follow-up (recurrent = 0)
+      if(follow_time[i] > start){
+        rows_i[[row_id]] <- data.frame(
+          id=i, tstart=start, tstop=follow_time[i],
+          recurrent=0, trt=trt_sf[i]
+        )
+      }
+      break
+    }
+  }
+  recurrent_rows[[i]] <- do.call(rbind, rows_i)
+}
+
+recurrentDat <- do.call(rbind, recurrent_rows)   # many rows per patient
+terminalDat <- data.frame(                        # one row per patient
+  id = seq_len(n_sf),
+  time = follow_time,
+  death = death_sf,
+  trt = trt_sf
+)
+
+c(
+  recurrent_rows = nrow(recurrentDat),
+  recurrent_events = sum(recurrentDat$recurrent),
+  deaths = sum(terminalDat$death)
+)
+```
+
+The frailty `(1 | id)` is written only in the recurrent-event formula. The argument `assocSurv = TRUE` shares it into the terminal formula, scaled by the estimated $\varphi$. The `truncation = tstart` argument makes each interval a left-truncated risk period.
+
+```{r, cache=TRUE}
+M_shared_frailty <- joint(
+  formSurv = list(
+    inla.surv(tstop, recurrent, truncation = tstart) ~ trt + (1 | id),  # recurrent, holds the frailty
+    inla.surv(time, death) ~ trt                                        # terminal, receives the shared frailty
+  ),
+  dataSurv = list(recurrentDat, terminalDat),
+  id = "id",
+  basRisk = c("rw1", "rw1"),
+  assocSurv = TRUE,                       # share the recurrent frailty into the terminal model
+  control = list(int.strategy = "eb")
+)
+
+summary(M_shared_frailty, sdcor = TRUE, hr = TRUE)
+```
+
+- `trt_S1`, the treatment effect on the recurrent stream. Simulated at -0.25.
+- `trt_S2`, the treatment effect on death. Simulated at -0.35.
+- the frailty standard deviation, how much patients differ in hidden recurrent-event risk. Simulated at 0.50.
+- the shared-frailty association, the row linking the two processes, the estimate of $\varphi$. With `hr = TRUE` it prints as $\exp(\varphi)$. A value above 1 means the hidden risk that raises recurrent events also raises the death hazard. Simulated positive, at $\varphi = 0.80$.
+
+A separate analysis estimates each treatment effect but says nothing about whether the patients prone to recurrences are the patients prone to death. The shared frailty answers that, and a positive association is direct evidence that common unmeasured factors drive both.
+
+When the data come as raw recurrent event times rather than pre-built intervals, `inla.surv` also accepts a `subject =` argument that performs the counting-process expansion automatically.
+
+Each of these survival models can in turn serve as the survival component of a joint model, linked to a longitudinal marker through shared random effects.
