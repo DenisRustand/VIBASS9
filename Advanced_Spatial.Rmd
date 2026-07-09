@@ -1,0 +1,624 @@
+---
+title: "Spatial"
+author: "Denis Rustand"
+date: "July 8 and 9, 2026"
+subtitle: |
+  Bayesian survival, longitudinal and joint models with INLA \
+  VIBASS 9, Valencia, Spain
+output:
+  html_document:
+    toc: false
+    toc_float: false
+    code_folding: show
+    theme: flatly
+    mathjax: default
+  pdf_document:
+    toc: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 6, fig.height = 4)
+options(ggplot2.continuous.colour = "viridis")
+options(ggplot2.continuous.fill = "viridis")
+```
+
+```{r libs}
+library(ggplot2)
+library(rnaturalearth)  # map data
+library(spdep)          # neighbor structures
+library(sf)             # spatial data handling
+library(Matrix)         # sparse matrices
+library(INLA)           # the engine
+library(INLAjoint)      # model building and predictions
+library(fmesher)        # mesh for the SPDE
+library(ggpubr)         # ggarrange layout
+```
+
+# Where our models stop working
+
+Every model so far has rested on one assumption. Once we condition on the fixed and random effects, patients are independent. One patient's tumor size and one patient's risk of death say nothing extra about another patient.
+
+That assumption holds when the only structure in the data lives at the patient level. It breaks the moment patients share something we never measured.
+
+Picture our cancer trial spread across France. Patients live in different regions. Each region carries hidden risk we did not record:
+
+- air pollution and industrial exposure
+- distance to a specialized cancer center
+- regional screening and referral habits
+- local diet, smoking and socioeconomic patterns
+
+Two patients from the same region share all of this. Their outcomes move together for reasons that have nothing to do with treatment or tumor size.
+
+What happens if we ignore that shared regional risk and fit our usual model? The model has nowhere to store a regional effect, so the signal leaks. The hidden risk gets pushed onto whatever covariate happens to line up with geography. If one treatment arm was recruited more heavily in polluted regions, the treatment effect quietly absorbs the pollution. The estimate is biased and nothing in the output would warn us.
+
+This is spatial autocorrelation. Nearby patients are more alike than distant ones. We fix it the same way we fixed within-patient correlation, with a random effect. This time the random effect lives in space.
+
+Two kinds of spatial data ask for two tools:
+
+- **Aggregated (areal) data.** Patients grouped into regions. We model one effect per region and let neighbors share information. This gives the Besag and BYM2 models.
+- **Point-referenced data.** Each patient has exact coordinates. We model a smooth surface over the whole map. This gives the SPDE approach.
+
+One practical point before the code. These spatial effects are not built into the `joint()` shortcut. The plan stays simple every time. We let `INLAjoint` build the model and its design matrices with `run = FALSE`, swap in the spatial term, then fit with `R-INLA`. We keep the `INLAjoint` convenience and add the full `R-INLA` spatial toolbox.
+
+# Aggregated data: the map and its neighbors
+
+We start with areal data. Patients are labeled by region, and we want one spatial effect per region.
+
+The map of mainland France splits into 94 departments. We treat each department as the home region of the patients living in it.
+
+```{r}
+set.seed(1)
+fr0 <- ne_states("france")
+fr1 <- fr0[fr0$type != "Overseas département" & fr0$region != "Corse", ]
+dim(fr1)
+ggplot() + geom_sf(data = fr1) + theme_minimal()
+```
+
+A spatial model needs to know which regions touch. We build a neighbor list, then store the adjacency as a sparse `Graph` matrix in the format `R-INLA` expects.
+
+```{r}
+nblist <- poly2nb(fr1)
+nn <- card(nblist)
+n.areas <- length(nn)
+graph.file <- "graph.file"
+nb2INLA(file = graph.file, nb = nblist)
+Graph <- sparseMatrix(i = rep(1:length(nn), nn),
+                      j = unlist(nblist[nn > 0]), x = 1)
+```
+
+Why not just add a fixed effect for each region? With 94 regions and some holding only a handful of patients, one free parameter per region would be noisy. A region with five patients would give a wild risk estimate that we could not trust. The spatial random effect avoids this by letting each region borrow strength from its neighbors, so sparse regions lean on the better-informed areas around them.
+
+# The Besag model
+
+The Besag model (an intrinsic conditional autoregressive model) is the simplest areal random effect.
+
+The idea in one line:
+
+- Each region's effect is pulled toward the average of its neighbors.
+- The map is smooth. High-risk regions tend to sit beside other high-risk regions.
+- A scaling step makes the variance parameter readable, so it means the same thing on any map.
+
+To see it in action we first simulate a regional risk surface, then generate survival times from it. We use `inla.qsample` to draw a spatially structured effect with precision 1.
+
+```{r}
+set.seed(2)
+tau.spatial <- 1
+R <- Diagonal(n = length(nn), x = nn) - Graph
+sconstr <- list(A = matrix(1, 1, nrow(R)), e = 0)
+R.scaled <- inla.scale.model(Q = R + Diagonal(nrow(R)) * 1e-5, constr = sconstr)
+s.besag <- inla.qsample(n = 1, Q = R.scaled * tau.spatial, constr = sconstr, seed = 4)
+ggplot() + geom_sf(data = fr1, aes(fill = s.besag)) + theme_minimal()
+```
+
+The model for the risk of death adds this regional effect on top of treatment:
+
+$$\lambda_{i}(t)=\lambda_{0}(t)\ \exp\left(\gamma\cdot trt_i  + b_{s(i)}\right)$$
+
+Here $b_{s(i)}$ is the effect of the region $s(i)$ where patient $i$ lives. We assign 2000 patients to regions, then simulate time to death conditional on treatment and regional risk.
+
+```{r}
+set.seed(3)
+n <- 2000
+gamma_1 <- 0.2     # treatment effect
+baseScale <- 0.5   # Weibull baseline scale
+baseShape <- 1.3   # Weibull baseline shape
+followup <- 4       # study duration
+trt <- rbinom(n, 1, 0.5)
+id_s <- sample(1:n.areas, n, replace = TRUE)   # assign each patient to a region
+u <- runif(n)
+eventTimes <- (-(log(u)) / (baseScale * exp(trt * gamma_1 + s.besag[id_s])))^(1/baseShape)
+eventIndic <- as.numeric(eventTimes < followup)
+eventTimes <- pmin(eventTimes, followup)
+datSbesag <- data.frame(id = 1:n, eventTimes, eventIndic, trt, id_s)
+str(datSbesag)
+```
+
+Now the build-then-swap step. We ask `joint()` to set up a survival model with an iid region-level random effect, but we stop before fitting with `run = FALSE`. We then rewrite the formula to replace that iid effect with a Besag effect on the same id, fed by our `Graph`.
+
+```{r, cache=TRUE}
+M_bs0 <- joint(formSurv = list(inla.surv(eventTimes, eventIndic) ~ trt + (1 | id_s)),
+               dataSurv = datSbesag, id = "id_s", run = FALSE)
+M_bs0$.args$formula <- as.formula(paste(c("Yjoint ~ -1 ",
+      attr(terms(M_bs0$.args$formula), which = "term.labels")[1:3],
+      "f(IDIntercept_S1, model='besag', graph=Graph, scale.model=TRUE)"),
+      collapse = "+"))
+M_bs <- joint.run(M_bs0)
+summary(M_bs)
+```
+
+In the summary, the `frailty term variance` is the variance of the Besag effect. The baseline was simulated as Weibull and estimated with a random walk, and the treatment effect sits near its true value.
+
+Did the model recover the regional risk we simulated? We can read the posterior mean per region straight from `summary.random` and lay the fitted map beside the truth.
+
+```{r}
+fit <- M_bs$summary.random$IDIntercept_S1$mean
+ggarrange(ggplot() + geom_sf(data = fr1, aes(fill = fit)) + ggtitle("Fitted"),
+          ggplot() + geom_sf(data = fr1, aes(fill = s.besag)) + ggtitle("True"))
+```
+
+The fitted map tracks the simulated surface closely. We can also map the posterior standard deviation per region to see where the estimate is accurate and where it is less.
+
+```{r}
+fitsd <- M_bs$summary.random$IDIntercept_S1$sd
+ggarrange(ggplot() + geom_sf(data = fr1, aes(fill = fit)) + ggtitle("Fitted"),
+          ggplot() + geom_sf(data = fr1, aes(fill = fitsd)) + ggtitle("Standard deviation"))
+```
+
+The spatial effect is not handled directly by `INLAjoint` but we can still predict from it. We pick the highest-risk and lowest-risk regions, then build two new patients, one from each.
+
+```{r}
+minS <- M_bs$summary.random$IDIntercept_S1$ID[which.min(M_bs$summary.random$IDIntercept_S1$mean)]
+maxS <- M_bs$summary.random$IDIntercept_S1$ID[which.max(M_bs$summary.random$IDIntercept_S1$mean)]
+ND <- datSbesag[c(which(datSbesag$id_s %in% c(minS))[1],
+                  which(datSbesag$id_s %in% c(maxS))[1]), ]
+ND$eventTimes <- 0
+ND$eventIndic <- 0
+ND$id_s <- ifelse(ND$id_s == minS, "Lowest-risk region", "Highest-risk region")
+ND
+```
+
+To carry the regional effect into the prediction we pre-sample its posterior for these two regions with `inla.posterior.sample`, then hand the samples to `predict` through `set.samples`.
+
+```{r, cache=TRUE}
+NsampleHY <- 20
+NsampleFE <- 20
+Besag_samples <- sapply(inla.posterior.sample(NsampleHY * NsampleFE, M_bs,
+  selection = list("IDIntercept_S1" = c(minS, maxS))), function(x) x$latent)
+if (minS > maxS) Besag_samples <- Besag_samples[2:1, ]
+rownames(Besag_samples) <- unique(ND$id_s)
+P <- predict(M_bs, ND, horizon = 3, survival = TRUE,
+             set.samples = list("IDIntercept_S1" = Besag_samples))
+ggplot(P$PredS, aes(x = eventTimes, y = Surv_quant0.5)) + ylim(0, 1) +
+  geom_ribbon(aes(ymin = Surv_quant0.025, ymax = Surv_quant0.975), alpha = 0.1) +
+  geom_line() + theme_minimal() + facet_wrap(~id_s) + xlab("Time") +
+  ylab("Survival probability")
+```
+
+Two patients on the same treatment, same starting point, different home regions. Should their survival curves match? Under the Besag model they do not. The only thing separating them is where they live.
+
+If we skip the pre-sampling, `predict` treats the patient as a fresh draw from the marginal posterior, a patient who could live anywhere. The curve then carries the full spread of regional risk.
+
+```{r, cache=TRUE}
+ND2 <- ND[1, ]
+ND2$id_s <- "Undefined location"
+P <- predict(M_bs, ND2, horizon = 3, survival = TRUE)
+ggplot(P$PredS, aes(x = eventTimes, y = Surv_quant0.5)) + ylim(0, 1) +
+  geom_ribbon(aes(ymin = Surv_quant0.025, ymax = Surv_quant0.975), alpha = 0.1) +
+  geom_line() + theme_minimal() + facet_wrap(~id_s) + xlab("Time") +
+  ylab("Survival probability")
+```
+
+# The BYM2 model: structured plus unstructured
+
+The Besag model assumes every variation is smooth across space. Is that realistic for our trial? Probably not. Some regional differences are local variations with no link to neighbors.
+
+The BYM2 model fixes this. It splits the regional effect into two pieces:
+
+- a **spatially structured** part, smooth across neighbors (the Besag piece)
+- an **unstructured** part, independent per-region
+
+A single parameter, $\phi$, reports the share of the effect that is spatial. The variance parameter $\sigma_b^2$ is interpretable. Penalized complexity priors keep both well behaved.
+
+We simulate a BYM2 surface by mixing the Besag surface with iid noise, then generate survival times from it.
+
+```{r}
+set.seed(4)
+phi <- 0.5
+s.IID <- rnorm(n.areas)
+s.bym <- (sqrt(phi) * s.besag + sqrt(1 - phi) * s.IID)
+eventTimes <- (-(log(u)) / (baseScale * exp(trt * gamma_1 + s.bym[id_s])))^(1/baseShape)
+eventIndic <- as.numeric(eventTimes < followup)
+eventTimes <- pmin(eventTimes, followup)
+datSbym <- data.frame(id = 1:n, eventTimes, eventIndic, trt, id_s)
+summary(datSbym)[, -1]
+```
+
+The fit follows the Besag recipe, with two changes. We set `model = 'bym2'` and we drop `scale.model`, since BYM2 is already scaled by construction.
+
+```{r, cache=TRUE}
+M_bym0 <- joint(formSurv = list(inla.surv(eventTimes, eventIndic) ~ trt + (1 | id_s)),
+               dataSurv = datSbym, id = "id_s", run = FALSE)
+M_bym0$.args$data$IDbym_S1 <- M_bym0$.args$data$IDIntercept_S1
+M_bym0$.args$formula <- as.formula(paste(c("Yjoint ~ -1 ",
+  attr(terms(M_bs0$.args$formula), which = "term.labels")[1:3],
+  "f(IDbym_S1, model='bym2', graph=Graph)"), collapse = "+"))
+M_bym <- joint.run(M_bym0)
+summary(M_bym)
+```
+
+The summary now reports both the precision of the effect and $\phi$, the structured share. In `summary.random` the effect has twice the length of the Besag one. The first 94 values are the total per region, the next 94 are the unstructured part alone.
+
+```{r}
+fitted <- M_bym$summary.random$IDbym_S1$mean[1:94]
+ggarrange(ggplot() + geom_sf(data = fr1, aes(fill = fitted)) + ggtitle("Fitted"),
+          ggplot() + geom_sf(data = fr1, aes(fill = s.bym)) + ggtitle("True"))
+```
+
+## A regional effect on tumor size
+
+The same regional environment that changes the risk of death can also change tumor size. A patient in a polluted region may start with a larger tumor burden. We add a BYM2 effect to the longitudinal marker.
+
+$$\textrm{E}[Y_{i}(t)]=\beta_0 + b_{i0} + \beta_1\cdot t + \beta_2\cdot trt_i + \beta_3\cdot trt_i\cdot t +  b_{s(i)}$$
+
+We simulate repeated tumor size measurements that depend on the same regional surface, on top of a per-patient random intercept.
+
+```{r}
+set.seed(5)
+b_0 <- 2        # intercept
+b_1 <- -1       # slope over time
+b_2 <- -2       # treatment
+b_3 <- 1        # treatment by time
+b_e <- 1        # residual error
+b_intSD <- 0.5  # random intercept standard deviation
+mestime <- seq(0, 5, 1)
+n_i <- length(mestime)
+time <- rep(mestime, n)
+id <- rep(1:n, each = n_i)
+b_int <- rep(rnorm(n, 0, b_intSD), each = n_i)
+trtY <- rep(trt, each = n_i)
+linPred <- b_0 + b_int + b_1 * time + b_2 * trtY + b_3 * trtY * time +
+           rep(s.bym[id_s], each = n_i)
+Y <- rnorm(n_i * n, linPred, b_e)
+datLbym <- data.frame(id, time, Y, trt = trtY, id_s = rep(id_s, each = n_i))
+str(datLbym)
+```
+
+The build differs slightly. We keep the per-patient iid intercept that `joint()` gives us and add the spatial id on top, then swap in the BYM2 term.
+
+```{r, cache=TRUE}
+M_bymL0 <- joint(formLong = Y ~ time * trt + (1 | id),
+                 dataLong = datLbym, id = "id", timeVar = "time", run = FALSE)
+M_bymL0$.args$data$IDbym_L1 <- datLbym$id_s
+M_bymL0$.args$formula <- as.formula(paste(c("Yjoint ~ -1 ",
+          attr(terms(M_bymL0$.args$formula), which = "term.labels"),
+          "f(IDbym_L1, model='bym2', graph=Graph)"), collapse = "+"))
+M_bymL <- joint.run(M_bymL0)
+summary(M_bymL)
+```
+
+```{r}
+fitT <- M_bymL$summary.random$IDbym_L1$mean[1:94]
+ggarrange(ggplot() + geom_sf(data = fr1, aes(fill = fitT)) + ggtitle("Fitted"),
+          ggplot() + geom_sf(data = fr1, aes(fill = s.bym)) + ggtitle("True"))
+```
+
+## The joint model with a shared regional effect
+
+Here the cancer story comes together. We now place the same regional effect in both submodels at once.
+
+$$\left\{  \begin{array}{lc}
+\textrm{E}[Y_{i}(t)]= \beta_0 + b_{i0} + \beta_1\cdot t + \beta_2\cdot trt_i + \beta_3\cdot trt_i\cdot t + b_{s(i)}\\
+\lambda_i(t)=\lambda_0(t)\exp\left(\gamma_1\cdot trt_i + \gamma_2\cdot b_{s(i)}\right)
+   \end{array}
+\right.$$
+
+The regional effect shifts tumor size in the longitudinal part and scales the risk of death in the survival part. A polluted region can drive larger tumors and shorter survival at the same time, and the joint model reads both signals through one shared spatial term. The parameter $\gamma_2$ measures how strongly the regional tumor effect carries into the hazard.
+
+The build uses two passes. One model holds the iid intercept we want to keep. A second model is built only to construct the shared spatial id in the right internal format. We then copy that id across and swap in the shared, scaled BYM2 term. The `reorder = FALSE` option keeps the unsorted spatial id aligned.
+
+```{r, cache=TRUE}
+# model with the iid intercept we keep
+M_JMbym0 <- joint(formSurv = list(inla.surv(eventTimes, eventIndic) ~ trt),
+                 formLong = Y ~ time * trt + (1 | id),
+                 dataSurv = datSbym, dataLong = datLbym,
+                 id = "id", timeVar = "time", assoc = "", run = FALSE)
+# helper model to construct the shared spatial id
+M_JMbym1 <- joint(formSurv = list(inla.surv(eventTimes, eventIndic) ~ trt),
+                  formLong = Y ~ time * trt + (1 | id_s),
+                  dataSurv = datSbym, dataLong = datLbym,
+                  id = "id_s", timeVar = "time", assoc = "SRE_ind",
+                  reorder = FALSE, run = FALSE)
+# carry the spatial id across
+M_JMbym0$.args$data$IDbym_L1 <- M_JMbym1$.args$data$IDIntercept_L1
+M_JMbym0$.args$data$SRE_bym_L1_S1 <- M_JMbym1$.args$data$SRE_Intercept_L1_S1
+# define BYM2 in the longitudinal part, copy and scale it in the survival part
+M_JMbym0$.args$formula <- as.formula(paste(c("Yjoint ~ -1 ",
+  attr(terms(M_JMbym0$.args$formula), which = "term.labels"),
+  "f(IDbym_L1, model='bym2', graph=Graph) +
+   f(SRE_bym_L1_S1, copy='IDbym_L1', fixed=F)"), collapse = "+"))
+M_JMbym0$REstruc <- c(M_JMbym0$REstruc, "IDbym_L1")
+M_JMbym <- joint.run(M_JMbym0)
+summary(M_JMbym)
+```
+
+The fit returns the longitudinal part, the survival part and the shared regional effect together. The scaling parameter `SRE_bym_L1_S1` should cover the true value of 1, confirming the regional effect links the two outcomes.
+
+```{r}
+fitL <- M_JMbym$summary.random$IDbym_L1$mean[1:94]
+ggarrange(ggplot() + geom_sf(data = fr1, aes(fill = fitL)) + ggtitle("Fitted"),
+          ggplot() + geom_sf(data = fr1, aes(fill = s.bym)) + ggtitle("True"))
+```
+
+We are not limited to sharing the spatial effect alone. Any association from the joint model chapter can carry it. With `assoc = "CV"`, for instance, the whole linear predictor including the regional effect would be shared.
+
+For predictions we pick two patients from two regions, sample the regional posterior for those regions, then predict both tumor size and survival.
+
+```{r, cache=TRUE}
+NDbym <- datLbym[c(1, 1), ]
+NDbym$Y <- NA
+NDbym$id_s <- c(1, 8)   # two regions
+NDbym$id <- c(1, 2)
+NsampleHY <- 20
+NsampleFE <- 20
+Besag_samples <- sapply(inla.posterior.sample(NsampleHY * NsampleFE, M_JMbym,
+  selection = list("IDbym_L1" = NDbym$id_s)), function(x) x$latent)
+P <- predict(M_JMbym, NDbym, horizon = 3, survival = TRUE,
+             set.samples = list("IDbym_L1" = Besag_samples))
+ggarrange(
+  ggplot(P$PredL, aes(x = time, y = quant0.5)) +
+    geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975), alpha = 0.1) +
+    geom_line() + theme_minimal() + facet_wrap(~id) + xlab("Time") +
+    ylab("Tumor size"),
+  ggplot(P$PredS, aes(x = time, y = Surv_quant0.5)) + ylim(0, 1) +
+    geom_ribbon(aes(ymin = Surv_quant0.025, ymax = Surv_quant0.975), alpha = 0.1) +
+    geom_line() + theme_minimal() + facet_wrap(~id) + xlab("Time") +
+    ylab("Survival probability"), nrow = 2)
+```
+
+Both the tumor size path and the survival curve differ between the two patients, and the only thing we changed was their region.
+
+# Point-referenced data: the Matérn field and the SPDE
+
+Administrative regions have a weakness. Two patients living one kilometer apart but on opposite sides of a regional border are treated as different, while two patients ninety kilometers apart inside one large region are treated as identical.
+
+Does air pollution care about a line on a map? It does not. When we know each patient's exact coordinates, we can model risk as a smooth surface that ignores administrative borders and depends only on real distance.
+
+The standard tool is the Matérn correlation function. Two locations are similar when close and grow independent as they move apart. The headline parameter is the **range**, the distance at which correlation has nearly faded, around 0.13.
+
+- A short range means risk changes quickly over space.
+- A long range means broad, slow-moving regional patterns.
+
+```{r}
+rr <- c(1, 4)
+nus <- c(0.5, 1)
+plot(0, 0, xlim = c(0, 5), ylim = 0:1, type = "n",
+     xlab = "Distance", ylab = "Correlation", bty = "n")
+for (i in 1:2) for (j in 1:2)
+  plot(function(x) inla.matern.cov(x = x, nu = nus[i], corr = TRUE, d = 2,
+       kappa = sqrt(8 * nus[i]) / rr[j]), add = TRUE, 0, 5, n = 501,
+       lwd = j, lty = 3 - i)
+abline(h = 0.13, lty = 2, col = gray(0.5, 0.5))
+```
+
+The SPDE approach turns this smooth surface into something a computer can fit at scale. The steps:
+
+- Cover the map with a mesh of triangles.
+- Estimate the spatial effect at the mesh nodes.
+- Read any patient's value from the triangle around them.
+
+To make the point-referenced setting visible, we simulate patients across France, dense in the North-West and sparse in the South-East.
+
+```{r}
+set.seed(6)
+rpoint <- function(n, map, m.loc, s.loc = c(5, 5)) {
+  bb <- matrix(st_bbox(map), 2)
+  out <- matrix(NA, n, 2)
+  n0 <- 0
+  repeat {
+    if (missing(m.loc)) {
+      xy0 <- st_as_sf(data.frame(x = runif(n, bb[1, 1], bb[1, 2]),
+                                 y = runif(n, bb[2, 1], bb[2, 2])),
+                      coords = 1:2, crs = st_crs(map))
+    } else {
+      x0 <- rnorm(n, m.loc[1], s.loc[1])
+      y0 <- rnorm(n, m.loc[2], s.loc[2])
+      xy0 <- st_as_sf(data.frame(x = x0, y = y0), coords = 1:2, crs = st_crs(map))
+    }
+    id0 <- unlist(st_contains(map, xy0))
+    nn <- min(length(id0), n - n0)
+    if (nn > 0) {
+      out[n0 + 1:nn, ] <- st_coordinates(xy0[sample(id0, nn), ])
+      n0 <- n0 + nn
+    }
+    if (n0 >= n) break
+  }
+  return(out)
+}
+xy <- rpoint(n, fr1, m.loc = c(-2, 50), c(3, 3))
+xy_sf <- st_as_sf(data.frame(xy), coords = 1:2, crs = st_crs(fr1))
+ggplot() + theme_minimal() + geom_sf(data = fr1) + geom_sf(data = xy_sf)
+```
+
+Now the mesh. Why build it larger than France itself? Without an extension, the model treats the coastline as a wall and distorts the effect near the edges. Extending the mesh beyond the borders keeps the estimate smooth right up to the coast.
+
+```{r}
+bb <- matrix(st_bbox(fr1), 2)
+r2 <- apply(bb, 1, diff)
+rr <- mean(r2)
+the_crs <- st_crs(fr1)
+mesh <- fm_mesh_2d(boundary = fr1,
+  max.edge = rr / c(30, 10),  # fine inside, wide outside
+  offset = rr / c(10, 5),     # extension around the map
+  cutoff = rr / 60,           # avoid tiny triangles
+  crs = the_crs)
+ggplot() + geom_fm(data = mesh, fill = "white", color = "black") + theme_void()
+```
+
+The projector matrix `A` is the bridge from mesh nodes to patient locations. Each patient's row holds the weights of the three triangle corners around them, and those weights sum to one. This is the spatial design matrix, the same role $Z$ plays for ordinary random effects.
+
+```{r}
+A <- fm_evaluator(mesh = mesh, loc = xy)
+```
+
+We define the SPDE with penalized complexity priors, which make the range and variability easy to set as vague priors.
+
+```{r}
+spde <- inla.spde2.pcmatern(mesh = mesh, alpha = 2,
+  prior.range = c(rr / 50, 0.05),  # P(range < r0) = 0.05
+  prior.sigma = c(2, 0.05),        # P(sigma < s0) = 0.05
+  constr = TRUE)
+```
+
+To illustrate, we simulate a spatial field at the mesh nodes, project it to patient locations, then generate joint data from it.
+
+```{r}
+s.range <- rr / 5
+tau.SPDE <- 1
+Q.spatial <- inla.spde2.precision(spde = spde,
+  theta = log(c(s.range, 1 / sqrt(tau.SPDE))))
+spatialREmesh <- inla.qsample(n = 1, Q = Q.spatial, seed = 1)
+s.sample <- drop(A$proj$A %*% spatialREmesh)
+```
+
+The joint model is the same shape as before, with the spatial field shared between tumor size and risk of death:
+
+$$\left\{  \begin{array}{lc}
+\textrm{E}[Y_{i}(t)]= \beta_0 + b_{i0} + \beta_1\cdot t + \beta_2\cdot trt_i + \beta_3\cdot trt_i\cdot t + b_{s(i)} \\
+\lambda_i(t)=\lambda_0(t)\exp\left(\gamma_1\cdot trt_i + \gamma_2\cdot b_{s(i)}\right)
+   \end{array}
+\right.$$
+
+```{r}
+trtL <- rep(trt, each = n_i)
+linPred <- b_0 + b_int + b_1 * time + b_2 * trtL + b_3 * trtL * time +
+           rep(s.sample, each = n_i)
+Y <- rnorm(n_i * n, linPred, b_e)
+longDat <- data.frame(id, time, Y, trt = trtL)
+
+u <- runif(n)
+gamma_2 <- 0.7   # scaling of the spatial effect in the hazard
+eventTimes <- (-(log(u)) / (baseScale * exp(trt * gamma_1 + gamma_2 * s.sample)))^(1/baseShape)
+eventIndic <- as.numeric(eventTimes < followup)
+eventTimes <- pmin(eventTimes, followup)
+survDat <- data.frame(id = 1:n, eventTimes, eventIndic, trt)
+```
+
+The build mirrors the BYM joint model, with one difference. The mapping from patients to the field runs through coordinates, not a region label, so we feed the projector matrix to `R-INLA` with `A.local` and set the index to `NA` so the projector does the work.
+
+```{r, cache=TRUE}
+M_spde0 <- joint(formSurv = list(inla.surv(eventTimes, eventIndic) ~ trt),
+                 formLong = Y ~ time * trt + (1 | id), basRisk = "rw2",
+                 dataSurv = survDat, dataLong = longDat, id = "id",
+                 timeVar = "time", assoc = "SRE_ind", run = FALSE)
+# expand the projector to match the internal data layout
+id1.expand <- ifelse(is.na(M_spde0$.args$data$IDIntercept_L1), n + 1,
+                     M_spde0$.args$data$IDIntercept_L1)
+A1expand <- rbind(A$proj$A,
+                  sparseMatrix(i = 1, j = 1, x = 0, dims = c(1, mesh$n)))[id1.expand, ]
+id2.expand <- ifelse(is.na(M_spde0$.args$data$SRE_Intercept_L1_S1), n + 1,
+                     M_spde0$.args$data$SRE_Intercept_L1_S1)
+A2expand <- rbind(A$proj$A,
+                  sparseMatrix(i = 1, j = 1, x = 0, dims = c(1, mesh$n)))[id2.expand, ]
+# index set to NA so A.local maps each location to the mesh
+M_spde0$.args$data$IDspde_L1 <- rep(NA, length(M_spde0$.args$data$IDIntercept_L1))
+M_spde0$.args$data$SRE_spde_L1_S1 <- rep(NA, length(M_spde0$.args$data$IDIntercept_L1))
+M_spde0$.args$formula <- as.formula(paste(c("Yjoint ~ -1 ",
+  attr(terms(M_spde0$.args$formula), which = "term.labels")[1:8],
+  "f(IDspde_L1, model=spde, A.local=A1expand, values=1:spde$n.spde) +
+   f(SRE_spde_L1_S1, copy='IDspde_L1', fixed=F,
+     A.local=A2expand, values=1:spde$n.spde)"), collapse = "+"))
+M_spde <- joint.run(M_spde0)
+summary(M_spde)
+```
+
+The summary reports the fitted field under `Spatial effect` and its scaling under `Association longitudinal - survival`. The range, standard deviation and association should all cover the values we used to simulate.
+
+Now we map the field. We project the posterior onto a fine grid, both the mean and the standard deviation, and clip to the borders of France.
+
+```{r}
+grproj <- fm_evaluator(mesh = mesh, xlim = bb[1, ], ylim = bb[2, ],
+                       dims = round(200 * r2 / rr[1]))
+m.grid <- fm_evaluate(grproj, field = M_spde$summary.random$IDspde_L1$mean)
+sd.grid <- exp(fm_evaluate(grproj, field = log(M_spde$summary.random$IDspde_L1$sd)))
+gr.in <- st_contains(x = fr1,
+                     y = st_as_sf(as.data.frame(grproj$lattice$loc),
+                                  coords = 1:2, crs = st_crs(fr1)))
+m.grid[setdiff(1:nrow(grproj$lattice$loc), unlist(gr.in))] <- NA
+sd.grid[setdiff(1:nrow(grproj$lattice$loc), unlist(gr.in))] <- NA
+```
+
+```{r}
+library(terra)
+library(tidyterra)
+m_raster <- rast(data.frame(x = grproj$lattice$loc[, 1], y = grproj$lattice$loc[, 2],
+                            u = as.vector(m.grid)), crs = "+proj=longlat +datum=WGS84")
+sd_raster <- rast(data.frame(x = grproj$lattice$loc[, 1], y = grproj$lattice$loc[, 2],
+                             u = as.vector(sd.grid)), crs = "+proj=longlat +datum=WGS84")
+ggm <- ggplot() + theme_minimal() + geom_spatraster(data = m_raster) +
+  scale_fill_distiller(type = "div", palette = "RdBu", na.value = "transparent") +
+  geom_sf(data = fr1, fill = "transparent") + ggtitle("Mean effect") +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank())
+ggsd <- ggplot() + theme_minimal() + geom_spatraster(data = sd_raster) +
+  scale_fill_distiller(type = "div", palette = "RdBu", na.value = "transparent",
+                       transf = "log") +
+  geom_sf(data = fr1, fill = "transparent") + ggtitle("Standard deviation") +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank())
+ggarrange(ggm, ggsd)
+```
+
+Look at the standard deviation map. Why is the South-East so uncertain? We placed very few patients there. The model has little local information, so it relies on the prior and on far-off mesh nodes, and the uncertainty climbs. The data-rich North-West is estimated more accurately.
+
+We can predict at any coordinate. We pick two locations, one in the dense North-West and one in the sparse South-East, then sample the field at those points.
+
+```{r}
+pred.loc <- matrix(c(-1.5, 7, 49.5, 44), nrow = 2)
+pred.loc
+```
+
+We can represent these two locations on the map as follows:
+
+```{r}
+ggarrange(ggm + geom_point(aes(x=pred.loc[,1], y=pred.loc[,2]), size=3) +
+            theme(legend.position ="none"),
+          ggsd + geom_point(aes(x=pred.loc[,1], y=pred.loc[,2]), size=3) +
+            theme(legend.position = "none")) 
+```
+
+```{r}
+Apred <- apply(pred.loc, 1, function(x) fm_evaluator(mesh, matrix(x, nrow = 1))$proj$A)
+NsampleHY <- 20
+NsampleFE <- 20
+S_samples_mesh <- sapply(inla.posterior.sample(NsampleHY * NsampleFE, M_spde,
+  selection = list("IDspde_L1" = 1:spde$n.spde)), function(x) x$latent)
+S_samples_id <- t(sapply(Apred, function(Ai) drop(Ai %*% S_samples_mesh)))
+```
+
+We build two new patients on the same treatment, no tumor history, differing only in location, then predict.
+
+```{r, cache=TRUE}
+ND <- data.frame(id = c("North-West", "South-East"), trt = 0, time = 0, Y = NA)
+P <- predict(M_spde, ND, horizon = 3, survival = TRUE,
+             set.samples = list("IDspde_L1" = S_samples_id))
+ggarrange(
+  ggplot(P$PredL, aes(x = time, y = quant0.5)) +
+    geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975), alpha = 0.1) +
+    geom_line() + theme_minimal() + facet_wrap(~id) + xlab("Time") +
+    ylab("Tumor size"),
+  ggplot(P$PredS, aes(x = time, y = Surv_quant0.5)) + ylim(0, 1) +
+    geom_ribbon(aes(ymin = Surv_quant0.025, ymax = Surv_quant0.975), alpha = 0.1) +
+    geom_line() + theme_minimal() + facet_wrap(~id) + xlab("Time") +
+    ylab("Survival probability"), nrow = 2)
+```
+
+The two patients differ in their tumor size path and their survival curve, and also in the width of their credible bands. Location alone moves the prediction, and the amount of local data sets our confidence in it.
+
+# Choosing between them
+
+A short guide to which tool fits which situation:
+
+- Use **Besag or BYM2** when patients carry only a region label, not coordinates. BYM2 is the safer default, since it allows both smooth regional patterns and local per-region variation.
+- Use **SPDE** when you have real coordinates and risk varies continuously, like distance from a pollution source or proximity to a care center.
+- A spatial effect behaves like any other random effect in a joint model. You can share it across longitudinal markers and survival, scale it across submodels and predict from it.
+
+The same regional environment that grows a tumor faster can also shorten a life. Fitted apart, a longitudinal model and a survival model would each miss that shared cause. A spatially structured model accounts for this autocorrelation properly.
