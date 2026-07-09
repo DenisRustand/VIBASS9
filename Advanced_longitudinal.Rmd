@@ -1,0 +1,540 @@
+---
+title: "Advanced longitudinal"
+author: "Denis Rustand"
+date: "July 8 and 9, 2026"
+subtitle: |
+  Bayesian survival, longitudinal and joint models with INLA \
+  VIBASS 9, Valencia, Spain
+output:
+  html_document:
+    toc: false
+    toc_float: false
+    code_folding: show
+    theme: flatly
+    mathjax: default
+  pdf_document:
+    toc: false
+---
+
+```{=html}
+<style>
+pre, pre code {
+  white-space: pre !important;
+  overflow-x: auto !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+blockquote {
+  border-left: 4px solid #2c8c99;
+  background: #f3f8f9;
+  padding: 0.6em 1em;
+}
+</style>
+```
+
+```{r setup, include=FALSE}
+options(width = 200)
+knitr::opts_chunk$set(cache = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 6, fig.align = "center")
+```
+
+```{r, cache=FALSE}
+library(INLA)
+library(INLAjoint)
+library(ggplot2)
+library(ggpubr)
+library(survival)
+```
+
+```{r}
+load("cancer_trial_data.RData")
+```
+
+# Generalized longitudinal mixed models
+
+There are often multiple markers of different nature recorded on the same patients:
+
+- lesion counts at each scan
+- a toxicity indicator, present or absent
+- an ordered toxicity grade
+- biomarker panels and quality-of-life scores
+
+The model structure we have used so far can be extended, we keep:
+
+- fixed effects for the population curve
+- random effects for each patient's own departure from it
+
+Two things change:
+
+- the **likelihood**, the distribution we assume for the marker
+- the **link function**, the bridge from the linear predictor to that distribution
+
+$$Y_{ij} \mid b_i \sim \text{distribution suited to the marker},
+\qquad g\{E(Y_{ij} \mid b_i)\}=\eta_i(t_{ij}).$$
+
+Standard regression will fail in some situations:
+
+- a count of zero lesions, and a fitted mean that dips below zero
+- a yes/no outcome, and a predicted probability above one
+- grades Low, Moderate, High, and a fitted value of 2.7
+- a variance that should grow with the mean, held constant instead
+
+## Poisson mixed model for lesion counts
+
+Where the Gaussian model gives up:
+
+- a count is a non-negative integer, never 1.7, never below zero
+- count spread rises with the mean, so a constant variance is the wrong assumption
+- counts are not symmetric around the mean
+
+What Poisson changes:
+
+- mass sits only on 0, 1, 2 and upward
+- the log link keeps the expected count positive for any value of the linear predictor
+- variance grows with the mean by construction, no extra assumption needed
+- coefficients act multiplicatively on the count
+
+For patient $i$ at visit $j$,
+
+$$Y_{ij} \mid b_i \sim \text{Poisson}(\lambda_{ij}),
+\qquad \log(\lambda_{ij}) = \eta_i(t_{ij}).$$
+
+Read the coefficients on the count scale through the exponential. A value of $-0.20$ means the expected number of lesions is multiplied by $\exp(-0.20)$, close to an 18% drop.
+
+```{r}
+set.seed(1)
+n_p <- 500
+visit_times <- 0:5
+
+datPois <- expand.grid(id = 1:n_p, time = visit_times)
+datPois <- datPois[order(datPois$id, datPois$time), ]
+datPois$trt <- rep(rbinom(n_p, 1, 0.5), each = length(visit_times))
+datPois$Treatment <- factor(datPois$trt, levels = c(0, 1),
+                            labels = c("B (chemo)", "A (immuno)"))
+
+b_pois <- rep(rnorm(n_p, 0, 0.5), each = length(visit_times))
+eta_pois <- 1 + b_pois - 0.25 * datPois$time - 0.35 * datPois$trt + 0.08 * datPois$time * datPois$trt
+datPois$Y <- rpois(nrow(datPois), exp(eta_pois))
+```
+
+```{r}
+pois_mean <- aggregate(Y ~ time + Treatment, datPois, mean)
+
+ggplot(datPois, aes(x = time, y = Y, group = id, color = Treatment)) +
+  geom_line(alpha = 0.08) +
+  geom_point(alpha = 0.10, size = 0.6) +
+  geom_line(data = pois_mean, aes(group = Treatment), linewidth = 1.2) +
+  labs(x = "Time", y = "Number of lesions") +
+  scale_color_manual(values = c("gray40", "steelblue")) +
+  theme_minimal()
+```
+
+> - which arm starts with more lesions?
+> - which arm falls faster?
+> - does any single patient line drop all the way to a clean scan?
+
+```{r, cache=TRUE}
+M_pois <- joint(
+  formLong = Y ~ time * trt + (1 | id),
+  dataLong = datPois,
+  id = "id",
+  timeVar = "time",
+  family = "poisson",
+  control = list(int.strategy = "eb")
+)
+summary(M_pois, sdcor = TRUE)
+```
+
+- the treatment row, on the log-rate scale, becomes a rate ratio after the exponential
+- the random-intercept standard deviation says how far lesion burden changes from patient to patient, adjusted for time and treatment
+
+We built arm A to start near $\exp(-0.35)$, about 0.70 of arm B, and to reduce lesions a little slower.
+
+For Gaussian SLD the link is the identity, so the prediction already sits on the observed scale. For counts and yes/no markers the model works on the linear predictor scale by default. One argument, `inv.link = TRUE`, asks `predict()` to push every posterior draw back through the link before it summarizes, so the interval lands on the count or probability scale we care about.
+
+```{r, cache=TRUE}
+pois_ids <- unique(datPois$id)[1:4]
+new_pois <- datPois[datPois$id %in% pois_ids, ]
+# new_pois <- new_pois[new_pois$time<=2,] # only use first 3 measures
+pred_pois <- predict(M_pois, newData = new_pois, horizon = 5, id = "id",
+                     inv.link = TRUE)
+
+ggplot(pred_pois$PredL, aes(x = time, y = quant0.5)) +
+  geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975),
+              fill = "steelblue", alpha = 0.18) +
+  geom_line(color = "steelblue") +
+  geom_point(data = new_pois, aes(x = time, y = Y), size = 1) +
+  facet_wrap(~id) +
+  labs(x = "Time", y = "Expected lesion count") +
+  theme_minimal()
+```
+
+With `inv.link = TRUE` the curve is not the log-count line. It is the posterior median of $\lambda_{ij}$, the expected lesion count itself, with an interval on this scale.
+
+## Binomial mixed model for toxicity yes/no
+
+Now consider toxicity is recorded at each visit as present or absent.
+
+- the outcome is 0 or 1, nothing in between
+- a straight line mean is not bounded, predicting probabilities that cannot exist
+- the spread of a 0/1 draw is $p(1-p)$, widest at one half, so a constant variance is wrong
+- the residual is two points, not a bell
+
+What the logistic model changes:
+
+- a Bernoulli likelihood for the 0/1 draw
+- a logit link that folds the whole real line into the open interval from 0 to 1
+- coefficients on the log-odds scale, with the exponential giving an odds ratio
+- predictions pushed back to a probability through the inverse link
+
+$$Y_{ij} \mid b_i \sim \text{Bernoulli}(p_{ij}),
+\qquad \text{logit}(p_{ij}) = \eta_i(t_{ij}).$$
+
+```{r}
+datBinom <- datPois[, c("id", "time", "trt", "Treatment")]
+eta_binom <- -1 + b_pois + 0.15 * datBinom$time +  0.70 * datBinom$trt - 0.50 * datBinom$time * datBinom$trt
+datBinom$Y <- rbinom(nrow(datBinom), size = 1, prob = plogis(eta_binom))
+```
+
+```{r}
+tox_prop <- aggregate(Y ~ time + Treatment, datBinom, mean)
+
+ggplot(tox_prop, aes(x = time, y = Y, color = Treatment)) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 1) +
+  labs(x = "Time", y = "Observed toxicity proportion") +
+  scale_color_manual(values = c("gray40", "steelblue")) +
+  theme_minimal()
+```
+
+```{r, cache=TRUE}
+M_binom <- joint(
+  formLong = Y ~ time * trt + (1 | id),
+  dataLong = datBinom,
+  id = "id",
+  timeVar = "time",
+  family = "binomial",
+  control = list(int.strategy = "eb")
+)
+summary(M_binom, sdcor = TRUE)
+```
+
+```{r, cache=TRUE}
+binom_ids <- unique(datBinom$id)[1:4]
+new_binom <- datBinom[datBinom$id %in% binom_ids, ]
+# new_binom <- new_binom[new_binom$time<=2,] # only use first 3 measures
+
+pred_binom <- predict(M_binom, newData = new_binom, horizon = 5, id = "id",
+                      inv.link = TRUE)
+
+ggplot(pred_binom$PredL, aes(x = time, y = quant0.5)) +
+  geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975),
+              fill = "steelblue", alpha = 0.18) +
+  geom_line(color = "steelblue") +
+  geom_point(data = new_binom, aes(x = time, y = Y), size = 1) +
+  facet_wrap(~id) +
+  labs(x = "Time", y = "Predicted toxicity probability") +
+  theme_minimal()
+```
+
+The points are 0 and 1. The line is the predicted probability of toxicity given each patient's own history, and the band is on the probability scale.
+
+## Ordinal mixed model for toxicity grade
+
+Many oncology toxicities are categorized as ordered grades.
+
+- a grade is ordered, Low below Moderate below High, but the steps are not numeric
+- code them 1, 2, 3 and a straight line assumes the step Low to Moderate equals Moderate to High
+- it can predict 2.7, a grade that does not exist
+
+What the proportional-odds model changes:
+
+- it works on cumulative probabilities, $P(Y \le k)$
+- a set of ordered cut-points marks the thresholds between grades
+- one slope per covariate shifts every threshold together, the proportional-odds idea
+- order is respected, equal spacing is not assumed
+
+$$\text{logit}\{P(Y_{ij} \le k \mid b_i)\} = \alpha_k - \eta_i(t_{ij}).$$
+
+The cut-points $\alpha_k$ set the boundaries. The linear predictor slides probability mass toward lower or higher grades.
+
+Written out for $K$ ordered grades $y_k\ (k = 1, \dots, K)$, the proportional odds model is
+
+$$F(k) = P(Y \le k) = \frac{\exp(\gamma_k)}{1 + \exp(\gamma_k)}, \qquad \gamma_k = \alpha_k - \eta_i(t),$$
+
+where the $\alpha_k$ form an increasing sequence of $K - 1$ cut-points,
+
+$$\alpha_0 = -\infty < \alpha_1 < \alpha_2 < \dots < \alpha_{K-1} < \alpha_K = +\infty,$$
+
+and the linear predictor carries the covariates and the random effects, for example considering a random intercept:
+
+$$\eta_i(t) = \beta_0 + b_{i0} + \beta_1\, t + \beta_2\, trt_i + \beta_3\, trt_i\, t.$$
+
+We simulate from this model with four cut-points, giving five ordered grades that we read as toxicity grades 1 (mildest) to 5 (most severe). Here treatment and time both raise the linear predictor, so both push probability mass toward the worse grades.
+
+```{r}
+set.seed(4)
+
+n <- 500 # number of patients
+
+# draw an ordinal outcome from a proportional odds model
+rpom <- function(alpha, eta) { # alpha: cut-points, eta: linear predictor
+  Flog  <- function(x) 1 / (1 + exp(-x)) # logistic CDF -> logit link
+  ns <- length(eta)
+  nc <- length(alpha) + 1
+  y  <- numeric(ns)
+  for (k in 1:ns) {
+    p    <- diff(c(0, Flog(alpha - eta[k]), 1))
+    y[k] <- sample(1:nc, 1, prob = p)
+  }
+  y
+}
+
+time <- rep(seq(0, 10, 1), n) # 11 visits per patient
+id   <- rep(1:n, each = 11) # patient id
+b0   <- rep(rnorm(n, 0, 0.5), each = 11) # random intercepts
+trt  <- rep(rbinom(n, 1, 0.5), each = 11) # arm: 0 = chemo, 1 = immuno
+
+# linear predictor: time worsens toxicity, and the immuno arm worsens it too
+linPred <- b0 + 0.1 * time + 1 * trt
+alpha   <- quantile(linPred, c(0.2, 0.4, 0.6, 0.8))  # 4 cut-points -> grades 1..5
+
+Grade  <- rpom(alpha, linPred)
+datOrd <- data.frame(id, time, Grade, trt = factor(trt))
+datOrd$Treatment <- factor(datOrd$trt, levels = c(0, 1),
+                           labels = c("B (chemo)", "A (immuno)"))
+```
+
+The outcome is an ordered grade, spread across the five levels:
+
+```{r}
+table(datOrd$Grade)
+```
+
+Individual toxicity trajectories over follow-up (a random sample of patients):
+
+```{r}
+set.seed(1)
+show <- sample(unique(datOrd$id), 30)
+ggplot(subset(datOrd, id %in% show),
+       aes(time, Grade, group = id, colour = Treatment)) +
+  geom_line(alpha = 0.5) + geom_point(size = 1) +
+  scale_y_continuous(breaks = 1:5) +
+  labs(x = "Time", y = "Toxicity grade", colour = "Arm") +
+  theme_minimal()
+```
+
+We fit the model with `family = "pom"` and a logit link. Since `logit` is already the default for the `pom` family, writing `link = "logit"` here just makes the choice explicit.
+
+```{r, cache=TRUE}
+M_pom <- joint(formLong = Grade ~ -1 + time * trt + (1 | id),
+               dataLong = datOrd, id = "id", timeVar = "time",
+               family = "pom", link = "logit")
+summary(M_pom, sdcor = TRUE)
+```
+
+Here `pom` is INLA's proportional-odds family. The cut-points take the place of a single intercept, which is why the formula drops the global intercept.
+
+INLA stores the cut-points through an internal parameterization, so we convert the sampled `theta` values back to the $\alpha_k$ and compare them with the values used to simulate:
+
+```{r}
+theta <- inla.hyperpar.sample(1e5, M_pom, intern = TRUE)
+nms   <- paste(paste0("theta", 1:length(alpha)), "for POM")
+
+sim.alpha <- matrix(NA, nrow(theta), length(alpha))
+for (k in 1:length(alpha)) {
+  if (k == 1) {
+    sim.alpha[, k] <- theta[, nms[1]]
+  } else {
+    sim.alpha[, k] <- sim.alpha[, k - 1] + exp(theta[, nms[k]])
+  }
+}
+colnames(sim.alpha) <- paste0("alpha", 1:length(alpha))
+
+m1 <- colMeans(sim.alpha)
+m2 <- colMeans(sim.alpha^2)
+print(cbind(true = alpha, estimate = m1, stdev = sqrt(m2 - m1^2)))
+```
+
+The recovered cut-points are close to the truth: these are the boundaries that separate the five toxicity grades on the latent scale, while the fixed effects measure how covariates move a patient toward a higher (worse) grade.
+
+For treatment, the odds ratio at baseline is $\exp(\beta_2)$, so the immunotherapy arm carries about
+
+```{r}
+round(exp(M_pom$summary.fixed[2, 1]), 2)
+```
+
+times the odds of being in a worse toxicity grade than the reference arm. Because of the proportional-odds structure, "a worse grade" means the same shift applied at every threshold at once: the odds of grade $\ge 2$ versus grade 1, of grade $\ge 3$ versus grades $\le 2$, and so on up to grade 5 versus grades 1 to 4. A single odds ratio therefore summarizes the treatment's tendency to push patients toward higher toxicity across all grade boundaries.
+
+# Multiple longitudinal markers
+
+One patient often carries several markers at once, a size, a count, a score, all moving together.
+
+Where separate models are limited:
+
+- fit each marker on its own and you assume they are independent once covariates are in
+- but they come from the same patient, so their patient-specific parts move together
+- separate fits ignore that link and lose precision
+- they cannot answer "do patients high on marker A tend to also be high on marker B"
+- a sparse marker cannot borrow strength from a rich one, and there is no single coherent prediction across markers
+
+What the multivariate structure changes:
+
+- stack the submodels under one likelihood
+- let the patient random effects correlate across markers, `corLong = TRUE`
+- that correlation is the bridge between the markers
+- each marker keeps its own family and link, so Gaussian and Poisson sit side by side
+
+Consider the following markers: a continuous tumor-size measurement, a count of lesions, and a binary toxicity (yes or no). Each marker keeps its own link while sharing a correlated patient-specific intercept:
+
+$$\begin{aligned}
+\textrm{E}[\text{Size}_i(t)] &= \beta_{10} + b_{1i} + \beta_{11} t + \beta_{12}\, trt_i + \beta_{13}\, trt_i\, t \\
+\log \textrm{E}[\text{Count}_i(t)] &= \beta_{20} + b_{2i} + \beta_{21} t + \beta_{22}\, trt_i + \beta_{23}\, trt_i\, t \\
+\textrm{logit}\, \textrm{P}[\text{Tox}_i(t) = 1] &= \beta_{30} + b_{3i} + \beta_{31} t + \beta_{32}\, trt_i + \beta_{33}\, trt_i\, t
+\end{aligned}$$
+
+The three patient intercepts are drawn jointly, $(b_{1i}, b_{2i}, b_{3i}) \sim \mathcal{N}(0, \Sigma)$, and it is the off-diagonal of $\Sigma$ that link the markers together. The continuous outcome also carries an additive Gaussian residual error. We simulate from this model with correlated intercepts:
+
+```{r}
+set.seed(1)
+
+n  <- 200 # patients
+ni <- 6 # visits per patient (times 0..5)
+
+# true cross-marker random-intercept covariance (size, count, toxicity)
+Sigma <- matrix(c(0.50, 0.25, 0.15,
+                  0.25, 0.40, 0.20,
+                  0.15, 0.20, 0.35), nrow = 3)
+
+b <- mvtnorm::rmvnorm(n, mean = c(0, 0, 0), sigma = Sigma)
+
+dat      <- expand.grid(time = 0:5, id = 1:n)
+dat$trt  <- rep(rbinom(n, 1, 0.5), each = ni)
+dat$Treatment <- factor(dat$trt, levels = c(0, 1),
+                        labels = c("B (chemo)", "A (immuno)"))
+
+b1 <- rep(b[, 1], each = ni) # tumor-size intercepts
+b2 <- rep(b[, 2], each = ni) # lesion-count intercepts
+b3 <- rep(b[, 3], each = ni) # severe-toxicity intercepts
+
+# tumor size
+dat$Size <- rnorm(nrow(dat), 5 + b1 - 0.30 * dat$time - 0.50 * dat$trt + 0.5 * dat$time * dat$trt, 0.5)
+
+# lesion count
+dat$Count <- rpois(nrow(dat), exp(1.2 + b2 + 0.10 * dat$time + 0.80 * dat$trt + 0.03 * dat$time * dat$trt))
+
+# severe toxicity
+eta3 <- -1.0 + b3 + 0.15 * dat$time + 0.50 * dat$trt + 0.2 * dat$time * dat$trt
+dat$Tox <- rbinom(nrow(dat), size = 1, prob = 1 / (1 + exp(-eta3)))
+```
+
+The three markers evolve together, one row per visit:
+
+```{r}
+head(dat, 10)
+```
+
+Plotting them side by side, the continuous and count markers show their trajectories directly, while the binary marker shows its probability trend through the smoother:
+
+```{r}
+datPlot <- rbind(
+  data.frame(id = dat$id, time = dat$time, Treatment = dat$Treatment,
+             Marker = "Tumor size",       Value = dat$Size),
+  data.frame(id = dat$id, time = dat$time, Treatment = dat$Treatment,
+             Marker = "Lesion count",   Value = dat$Count),
+  data.frame(id = dat$id, time = dat$time, Treatment = dat$Treatment,
+             Marker = "Toxicity", Value = dat$Tox)
+)
+datPlot$Marker <- factor(datPlot$Marker, levels = c("Tumor size", "Lesion count", "Toxicity"))
+
+ggplot(datPlot, aes(time, Value, group = id, colour = Treatment)) +
+  geom_line(alpha = 0.5) +
+  facet_wrap(~ Marker, scales = "free_y") +
+  scale_colour_manual(values = c("gray40", "steelblue")) +
+  labs(x = "Time", y = "Observed marker", colour = "Arm") +
+  theme_minimal()
+```
+
+We fit all three markers together by passing a list of formulas and a vector of families, and switching on the cross-marker correlation with `corLong = TRUE`:
+
+```{r, cache=TRUE}
+M_multi <- joint(
+  formLong = list(
+    Size   ~ time * trt + (1 | id),
+    Count  ~ time * trt + (1 | id),
+    Tox ~ time * trt + (1 | id)
+  ),
+  dataLong = dat, id = "id", timeVar = "time",
+  family  = c("gaussian", "poisson", "binomial"),
+  corLong = TRUE,
+  control = list(int.strategy = "eb")
+)
+summary(M_multi, sdcor = TRUE)
+```
+
+`corLong = TRUE` estimates the correlation between the marker-specific random effects. It asks whether patients who have a high tumor burden also have a high lesion counts and toxicity risk. Setting it to `FALSE` would assume a block-diagonal structure, i.e. independent markers.
+
+Fitting three outcomes by hand in `R-INLA` means stacking them into a single response, giving each marker its own intercept and covariate columns, tying the three random intercepts through a shared (Cholesky-parameterized) precision, and copying that structure across markers. `INLAjoint` does all of this internally from the list of formulas. It also sets default priors tuned for these random-effect structures: with a weakly informative marker like the binary toxicity flag, stricter defaults can shrink its variance toward zero, whereas the `INLAjoint` default keeps the estimate closer to the truth.
+
+## Recovering the correlation structure
+
+Because we simulated the intercepts from a known $\Sigma$, we can overlay the true standard deviations and correlations (red dashed lines) on the posterior marginals, with the priors shown too:
+
+```{r}
+p <- plot(M_multi, sdcor = TRUE)$Covariances$L1
+
+# true values on the sd/correlation scale: sds on the diagonal, correlations off it
+trueSDcor <- cov2cor(Sigma) + diag(sqrt(diag(Sigma)) - 1)
+
+p + geom_vline(
+  data = data.frame(Effect = unique(p$data$Effect), TrueValues = c(trueSDcor)),
+  aes(xintercept = TrueValues), colour = 2, linetype = 2)
+```
+
+Same with priors:
+
+```{r}
+p <- plot(M_multi, sdcor = TRUE, priors = TRUE)$Covariances$L1
+p + geom_vline(
+  data = data.frame(Effect = unique(p$data$Effect), TrueValues = c(trueSDcor)),
+  aes(xintercept = TrueValues), colour = 2, linetype = 2)
+```
+
+The posteriors concentrate around the values used to simulate. The toxicity marker's variance is the least sharply identified, with the widest posterior, which is expected: a 0/1 outcome carries less information per observation than a continuous or count marker.
+
+## Interpretation
+
+The model answers two questions at once: how treatment moves each marker, and how the markers relate through the shared patient effects.
+
+For each submodel, read the coefficient on its own link scale:
+
+- Tumor size uses the identity link, so effects are in centimetres. Size reduces over follow-up, and the immunotherapy arm shrinks marginally faster.
+- Lesion count uses the log link, so exponentiated coefficients are rate ratios. The simulated treatment effect of $0.80$ gives a rate ratio of $\exp(0.80) \approx 2.23$: the immunotherapy arm accumulates about 123% more lesions at baseline.
+- Severe toxicity uses the logit link, so exponentiated coefficients are odds ratios. The simulated treatment effect of $0.50$ gives $\exp(0.50) \approx 1.65$: the immunotherapy arm carries about 65% higher odds of toxicity.
+
+The cross-marker correlations are the part separate models cannot give. Here all three are positive: a patient whose baseline tumor burden runs high also tends to accumulate more lesions and to be more prone to toxicity. That shared patient-level variation is exactly what independent fits discard, and estimating it lets a sparse marker borrow strength from a richer one and produces a single coherent prediction across all three.
+
+We can make the contrast explicit by refitting with the correlation switched off:
+
+```{r, cache=TRUE}
+M_multi_indep <- joint(
+  formLong = list(
+    Size   ~ time * trt + (1 | id),
+    Count  ~ time * trt + (1 | id),
+    Tox ~ time * trt + (1 | id)
+  ),
+  dataLong = dat, id = "id", timeVar = "time",
+  family  = c("gaussian", "poisson", "binomial"),
+  corLong = FALSE,
+  control = list(int.strategy = "eb")
+)
+summary(M_multi_indep, sdcor = TRUE)
+```
+
+Now the random effects are reported separately, one per marker, with no correlation between them. This is the same as fitting the three outcomes on their own, but it is still a useful setting in joint modeling: several independent markers can each feed the risk of one or more events.
+
+> This correlation is the same machinery that powers the joint model.
+>
+> - one patient, several markers, tied through shared or correlated random effects
+> - each marker can become a longitudinal submodel
+> - those same random effects can inform the risk of death through the association term
