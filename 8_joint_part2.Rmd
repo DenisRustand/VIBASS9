@@ -1,0 +1,916 @@
+---
+title: "Joint modeling of longitudinal and survival data"
+author: "Denis Rustand"
+date: "July 8 and 9, 2026"
+subtitle: |
+  Bayesian survival, longitudinal and joint models with INLA \
+  VIBASS 9, Valencia, Spain
+output:
+  html_document:
+    toc: false
+    toc_float: false
+    code_folding: show
+    theme: flatly
+    mathjax: default
+  pdf_document:
+    toc: false
+---
+
+```{=html}
+<style>
+pre, pre code {
+  white-space: pre !important;
+  overflow-x: auto !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+</style>
+```
+
+```{r setup, include=FALSE}
+options(width = 200)
+knitr::opts_chunk$set(cache = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+```
+
+```{r, cache=FALSE}
+library(INLA)
+library(INLAjoint)
+library(survival)
+library(ggplot2)
+library(ggpubr)
+library(mvtnorm)
+library(PermAlgo)
+```
+
+Let us consider a mixed-effects model for longitudinal data including fixed effects $\beta$, a random intercept $b_{i0}$ and a random slope of time $b_{i1}$:
+
+$$E[Y_{i}(t)] = \eta_i(t) = \beta_0 + b_{i0} + (\beta_1 + b_{i1})\cdot t + \beta_2\cdot trt_i + \beta_3\cdot trt_i\cdot t$$
+
+We can assume some relationship between the longitudinal and a survival model based on some components of $\eta_i(t)$. The risk of event is defined as:
+
+$$\lambda_i(t)=\lambda_0(t)\exp\left(h(\eta_i(t))\right)$$
+
+where $h(\eta_i(t))$ is a function of the parameters of the longitudinal model. Several association structures have been proposed in the literature, each one having a specific interpretation and purpose.
+
+Let's simulate the latent variables and the longitudinal observations that will be used across all examples of this session:
+
+```{r}
+set.seed(1)
+n <- 1000 # number of individuals
+fw <- 5 # follow-up duration
+b_0 <- 1 # intercept
+b_1 <- -1 # slope
+b_2 <- 1 # trt
+b_3 <- 0.5 # trt x slope
+b_e <- 0.5 # residual error
+
+mestime <- seq(0, fw, 1) # measurement times
+n_i <- length(mestime)
+time <- rep(mestime, n) # time column
+id <- rep(1:n, each = n_i) # individual id
+
+b1SD <- 1 # random intercept SD
+b2SD <- 0.7 # random slope SD
+cor_bintslo <- 0.6 # correlation
+cov_bintslo <- b1SD * b2SD * cor_bintslo
+Sigma <- matrix(c(b1SD^2, cov_bintslo,
+                  cov_bintslo, b2SD^2), ncol = 2)
+
+MVnorm <- rmvnorm(n, rep(0, 2), Sigma)
+b1 <- rep(MVnorm[, 1], each = n_i) # random intercepts
+b2 <- rep(MVnorm[, 2], each = n_i) # random slopes
+
+trt <- rbinom(n, 1, 0.5)
+trtY <- rep(trt, each = length(mestime))
+
+linPred <- b_0 + b1 + (b_1 + b2) * time + b_2 * trtY + b_3 * trtY * time
+Y <- rnorm(n_i * n, linPred, b_e)
+datJM_Lt <- data.frame(id, time, Y, trt = trtY)
+
+baseScale <- 0.1 # baseline hazard scale (exponential)
+s_1 <- 0.5 # first association parameter
+s_2 <- 1 # second association parameter
+```
+
+### Simulating survival data and informative dropout
+
+Before visualizing the data or fitting any models, we must finalize our simulation by generating the survival times. We assume the risk of the event is independent from the longitudinal process.
+
+Patients who experience the event drop out of the study and can no longer be measured. We apply this informative dropout to the longitudinal data by removing any measurements that occur after the event time.
+
+```{r}
+# Simulate event times using inverse transform sampling
+u <- runif(n)
+eventTimes <- -(log(u) / (baseScale * exp(0)))
+eventIndic <- as.numeric(eventTimes < fw)
+eventTimes <- pmin(eventTimes, fw)
+
+datJM_S <- data.frame(id = 1:n, eventTimes, eventIndic, trt)
+
+# Remove longitudinal measurements recorded after the event
+datJM_L <- datJM_Lt[-unlist(sapply(1:n, function(x)
+  which(datJM_Lt$time >= datJM_S$eventTimes[datJM_S$id == x] &
+          datJM_Lt$id == x))), ]
+
+cat("Event rate:", round(mean(eventIndic) * 100, 1), "%\n")
+cat("Median follow-up:", round(median(eventTimes), 2), "years\n")
+```
+
+Let's visualize the resulting simulated trial data. We start with the longitudinal biomarker trajectories using a spaghetti plot.
+
+```{r}
+datJM_L$Treatment <- factor(datJM_L$trt, levels = c(0, 1), labels = c("Control", "Treated"))
+
+ggplot(datJM_L, aes(x = time, y = Y, group = id, color = Treatment)) +
+  geom_line(alpha = 0.2) +
+  geom_smooth(aes(group = Treatment), method = "loess", linewidth = 1.2, se = FALSE) +
+  labs(x = "Time", y = "Longitudinal biomarker", 
+       title = "Spaghetti plot of biomarker trajectories") +
+  scale_color_manual(values = c("gray40", "steelblue")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The smoothing lines show a treatment effect on the biomarker slope, but individual variability is substantial. Furthermore, lines end abruptly due to dropout. Because this dropout is informative (linked to the random effects driving the event), the observed average at later times is heavily biased by the "survivors".
+
+Now, we evaluate the survival outcome using a Kaplan-Meier estimator.
+
+```{r}
+datJM_S$Treatment <- factor(datJM_S$trt, levels = c(0, 1), labels = c("Control", "Treated"))
+
+km <- survfit(Surv(eventTimes, eventIndic) ~ Treatment, data = datJM_S)
+plot(km, conf.int = TRUE, col = c("gray40", "steelblue"), lwd = 2,
+     xlab = "Time (years)", ylab = "Survival probability",
+     main = "Kaplan-Meier survival curves by treatment")
+legend("bottomleft", c("Control", "Treated"), col = c("gray40", "steelblue"), lwd = 2, bty = "n")
+```
+
+The survival curves overlap significantly. From a marginal perspective, the treatment effect on survival is very difficult to detect.
+
+### Independent models
+
+As we did in the previous individual sessions, we can attempt to fit independent regression models to these two datasets using INLAjoint.
+
+[Before we fit anything, what bias would we risk by modeling the marker and the event times in two fully separate steps?]{style="color:steelblue;"}
+
+#### Longitudinal submodel
+
+We fit a linear mixed-effects model adjusting for time, treatment, and their interaction, ignoring the survival process.
+
+```{r}
+M_indep_long <- joint(
+  formLong = Y ~ time * trt + (1 + time | id),
+  dataLong = datJM_L,
+  id = "id", timeVar = "time",
+  family = "gaussian",
+  control = list(int.strategy = "eb")
+)
+
+summary(M_indep_long)
+```
+
+The model estimates the fixed and random effects. However, it assumes the missing data (after the event) is Missing At Random (MAR). Since dropout is actually driven by the underlying individual trajectory, this assumption is violated, leading to biased estimates of the longitudinal slopes.
+
+#### Survival submodel
+
+We fit a proportional hazards model with an exponential baseline risk (matching our data generation), ignoring the longitudinal biomarker entirely.
+
+```{r}
+M_indep_surv <- joint(
+  formSurv = inla.surv(eventTimes, eventIndic) ~ trt,
+  dataSurv = datJM_S,
+  basRisk = "exponentialsurv",
+  control = list(int.strategy = "eb")
+)
+
+summary(M_indep_surv, hr = TRUE)
+```
+
+The marginal survival model struggles to find a significant treatment effect. By analyzing survival independently, we completely miss the underlying biology: the risk of death is driven by the biomarker's individual dynamics, which this model treats as unobserved noise.
+
+Independent models are fast and easy to fit, but they fall short for this kind of data:
+
+- Biased longitudinal trajectories: LME models fail to account for informative dropout, biasing the true population estimates.
+
+- Missing the biological link: Marginal survival models ignore the prognostic information dynamically captured by the biomarker over time.
+
+To correct these biases, recover the true parameters, and explicitly quantify how biomarker dynamics drive the hazard rate, we must model both processes simultaneously.
+
+## Plot setup: posterior marginals with true values {.unnumbered}
+
+We pre-define the true parameter values and reusable plot code strings. For each fitted model we only need to update `Plots_jm` and `TV3` (the true association values). The dashed red lines indicate the true values used for data generation.
+
+```{r}
+# True values shared by all simulation models
+TV1 <- c(b_0, b_1, b_2, b_3, b_e^2) # fixed effects + residual variance
+TV2 <- c(Sigma) # variance-covariance matrix elements
+
+# Plot code strings (evaluated after updating Plots_jm and TV3)
+P1 <- "Plots_jm$Outcomes$L1 +
+  geom_vline(aes(xintercept = TrueValues),
+             data = data.frame(Effect = unique(Plots_jm$Outcomes$L1$data$Effect),
+                               TrueValues = TV1),
+             colour = 2, linetype = 2) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())"
+
+P2 <- "Plots_jm$Covariances$L1 +
+  geom_vline(aes(xintercept = TrueValues),
+             data = data.frame(Effect = unique(Plots_jm$Covariances$L1$data$Effect),
+                               TrueValues = TV2),
+             colour = 2, linetype = 2) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        legend.position = 'none')"
+
+P3 <- "Plots_jm$Associations +
+  geom_vline(aes(xintercept = TrueValues),
+             data = data.frame(Effect = unique(Plots_jm$Associations$data$Effect),
+                               TrueValues = TV3),
+             colour = 2, linetype = 2) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())"
+```
+
+## Shared random effects independent (SRE_ind)
+
+The **shared random effects independent** structure links the longitudinal and survival processes by sharing each random effect separately. An individual with similar deviations from the average longitudinal profile is assumed to have a similar survival outcome. This structure is computationally simple because the shared components are time-constant:
+
+$$\lambda_i(t) = \lambda_0(t) \exp(\gamma_0 \cdot b_{i0} + \gamma_1 \cdot b_{i1})$$
+
+The fixed effects $\gamma_0$ and $\gamma_1$ scale each random effect independently in the survival submodel. A positive $\gamma_0$ means that individuals whose baseline marker level exceeds the population average have an elevated hazard at all time points, similarly for $\gamma_1$ and the slope. Because the shared components are time-fixed, no numerical integration over time is needed, making this the most computationally efficient association structure.
+
+We simulate event times using inverse transform sampling. For an exponential baseline $\lambda_0(t)=\mu$, the event time is: $$t = \frac{-\log(u)}{\mu\exp(\gamma_0\cdot b_{i0} + \gamma_1\cdot b_{i1})}$$
+
+```{r}
+u <- runif(n)
+eventTimes <- -(log(u) / (baseScale * exp(MVnorm[, 1] * s_1 + MVnorm[, 2] * s_2)))
+eventIndic <- as.numeric(eventTimes < fw)
+eventTimes <- pmin(eventTimes, fw)
+
+datJM_S <- data.frame(id = 1:n, eventTimes, eventIndic, trt)
+
+# Remove longitudinal measurements recorded after the event
+datJM_L <- datJM_Lt[-unlist(sapply(1:n, function(x)
+  which(datJM_Lt$time >= datJM_S$eventTimes[datJM_S$id == x] &
+          datJM_Lt$id == x))), ]
+
+cat("Event rate:", round(mean(eventIndic) * 100, 1), "%\n")
+cat("Median follow-up:", round(median(eventTimes), 2), "years\n")
+```
+
+We fit the joint model using `assoc = "SRE_ind"`:
+
+```{r}
+M_jm_sre_ind <- joint(
+  formSurv = inla.surv(eventTimes, eventIndic) ~ -1,
+  formLong  = Y ~ time * trt + (1 + time | id),
+  dataSurv  = datJM_S, dataLong = datJM_L,
+  id = "id", timeVar = "time", assoc = "SRE_ind",
+  control = list(int.strategy = "eb")
+)
+
+summary(M_jm_sre_ind, sdcor = TRUE)
+```
+
+**Hazard ratio interpretation.** We can convert the association parameters to hazard ratios:
+
+```{r}
+round(summary(M_jm_sre_ind, hr = TRUE)$AssocLS, 3)
+```
+
+The model recovers the true values ($\gamma_0 = 0.5$, $\gamma_1 = 1$). Both association parameters are positive: an individual whose baseline marker level is 1 unit above the population average faces a hazard `r round((summary(M_jm_sre_ind, hr=TRUE)$AssocLS[1,1]-1)*100, 0)`% higher at any given time. The posterior marginal distributions confirm recovery of all model parameters (dashed red lines indicate true values):
+
+```{r}
+Plots_jm <- plot(M_jm_sre_ind)
+TV3 <- c(s_1, s_2)
+ggarrange(eval(parse(text = P1)),
+          ggarrange(eval(parse(text = P2)),
+                    eval(parse(text = P3)), ncol = 2), nrow = 2)
+```
+
+We can also verify that the model recovered the individual random effects:
+
+```{r}
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 0.3), cex = 0.8)
+plot(MVnorm[, 1], M_jm_sre_ind$summary.random$IDIntercept_L1$mean[1:n],
+     xlab = "True", ylab = "Estimated", main = "Random intercept", pch = 16, cex = 0.5)
+abline(0, 1, col = 2, lty = 2)
+plot(MVnorm[, 2], M_jm_sre_ind$summary.random$IDtime_L1$mean[-(1:n)],
+     xlab = "True", ylab = "Estimated", main = "Random slope", pch = 16, cex = 0.5)
+abline(0, 1, col = 2, lty = 2)
+```
+
+=\> [Different association structures for different questions of interest]{style="color: purple;"}
+
+## Time-dependent individual deviation from the average longitudinal trend (SRE)
+
+Building upon the previous structure, the **time-dependent shared random effects** association allows the shared component to evolve over time. Instead of sharing each random effect independently, the model shares their linear combination evaluated at the current time $t$:
+
+$$\lambda_i(t) = \lambda_0(t) \exp\left(\gamma \cdot (b_{i0} + b_{i1} \cdot t)\right)$$
+
+This captures the *dynamic* nature of the individual's deviation from the population trajectory. Consider an individual with a high positive random intercept ($b_{i0} > 0$) but a strong negative random slope ($b_{i1} < 0$). At early time points their deviation from the mean is positive, so $\gamma > 0$ implies elevated hazard. As time progresses their trajectory crosses below the population average, so the term $(b_{i0} + b_{i1}t)$ becomes negative, leading to decreased hazard compared to the population. This structure captures how an individual's risk profile evolves as their biomarker deviates from the average over follow-up.
+
+Because the hazard now includes a time-dependent component, inverse transform sampling no longer has a closed form. We use the `PermAlgo` package to simulate event times conditional on this time-varying covariate:
+
+```{r}
+set.seed(2)
+gap2 <- 0.01
+mestime2 <- seq(0, fw, gap2)
+time2 <- rep(mestime2, n)
+n_i2 <- length(mestime2)
+trt2 <- rep(trt, each = n_i2)
+b12 <- rep(MVnorm[, 1], each = n_i2)
+b22 <- rep(MVnorm[, 2], each = n_i2)
+
+SRE_i <- b12 + b22 * time2 # individual deviation at time t
+
+DatTmp <- permalgorithm(n, n_i2, Xmat = matrix(SRE_i, ncol = 1), betas = s_1)
+DatTmp2 <- DatTmp[which(!duplicated(DatTmp$Id, fromLast = TRUE)),
+                  c("Id", "Event", "Stop")]
+
+datJM2_S <- data.frame(id = 1:n, eventTimes = mestime2[DatTmp2$Stop + 1],
+                        eventIndic = DatTmp2$Event, trt = trt)
+
+datJM2_L <- datJM_Lt[-unlist(sapply(1:n, function(x)
+  which(datJM_Lt$time >= datJM2_S$eventTimes[datJM2_S$id == x] &
+          datJM_Lt$id == x))), ]
+```
+
+We first set up the model without running the algorithm (`run = FALSE`) to inspect the internal data structure that `INLAjoint` constructs to evaluate the time-dependent association:
+
+```{r}
+M_jmSRE <- joint(
+  formSurv = inla.surv(eventTimes, eventIndic) ~ -1,
+  formLong  = Y ~ time * trt + (1 + time | id),
+  dataSurv  = datJM2_S, dataLong = datJM2_L,
+  id = "id", timeVar = "time", assoc = "SRE",
+  control = list(int.strategy = "eb"), run = FALSE
+)
+```
+
+=\> [Data structure for time-dependent associations]{style="color: purple;"}
+
+We can inspect the internal data structure for the first individual. The longitudinal components:
+
+```{r}
+id1 <- which(M_jmSRE$.args$data$IDIntercept_L1 == 1 |
+               M_jmSRE$.args$data$expand1..coxph == 1)
+sapply(M_jmSRE$.args$data[c(1:6, 8, 11)], function(x) round(x[id1], 2))
+```
+
+The first two rows belong to the longitudinal submodel. The next four rows are used to compute the linear combination of random effects at the midpoint of each survival interval. And the survival components:
+
+```{r}
+sapply(M_jmSRE$.args$data[c(14, 16, 8, 9, 21, 13)], function(x) round(x[id1], 2))
+```
+
+The column `SRE_L1_S1` links the computed linear combination to the survival submodel. Row 4 shows the combination is evaluated at time $\approx 0.16$, the midpoint of the first survival interval $[0, 0.31]$. More intervals gives a finer representation of the evolving association in the risk function.
+
+We now run the model:
+
+```{r}
+M_jmSRE <- joint.run(M_jmSRE)
+summary(M_jmSRE, sdcor = TRUE)
+```
+
+The single coefficient `SRE_L1_S1` quantifies the association between the subject's current deviation from the population-average trajectory and the risk of event. The posterior marginals confirm recovery of all parameters:
+
+```{r}
+Plots_jm <- plot(M_jmSRE)
+TV3 <- c(s_1)
+ggarrange(eval(parse(text = P1)),
+          ggarrange(eval(parse(text = P2)),
+                    eval(parse(text = P3)), ncol = 2), nrow = 2)
+```
+
+## Current value (CV)
+
+The **current value** association assumes the risk of the event at time $t$ depends on the *true* expected value of the entire linear predictor from the longitudinal submodel, sometimes called the true underlying value of the biomarker since it excludes the measurement error $\varepsilon$:
+
+$$\lambda_i(t) = \lambda_0(t) \exp\left(\gamma \cdot \eta_i(t)\right)$$
+
+Unlike the SRE structure, the CV structure incorporates the influence of **all covariates** (including treatment effects) on the longitudinal marker directly into the risk calculation. The association parameter $\gamma$ is interpreted as the log-hazard ratio for a one-unit increase in the true biomarker value. Of note, the CV and SRE associations are equivalent when there are no covariates in the longitudinal model (or when those covariates are also included in the survival part), because in those cases the hazard is shifted by a constant.
+
+```{r}
+set.seed(2)
+CV_i <- b_0 + b12 + (b_1 + b22) * time2 + b_2 * trt2 + b_3 * trt2 * time2
+
+DatTmp <- permalgorithm(n, n_i2, Xmat = matrix(CV_i, ncol = 1), betas = c(s_1))
+DatTmp2 <- DatTmp[which(!duplicated(DatTmp$Id, fromLast = TRUE)),
+                  c("Id", "Event", "Stop")]
+
+datJM3_S <- data.frame(id = 1:n, eventTimes = mestime2[DatTmp2$Stop + 1],
+                        eventIndic = DatTmp2$Event, trt = trt)
+
+datJM3_L <- datJM_Lt[-unlist(sapply(1:n, function(x)
+  which(datJM_Lt$time >= datJM3_S$eventTimes[datJM3_S$id == x] &
+          datJM_Lt$id == x))), ]
+```
+
+We fit the model with `assoc = "CV"`:
+
+```{r}
+M_jmCV <- joint(
+  formSurv = inla.surv(eventTimes, eventIndic) ~ -1,
+  formLong  = Y ~ time * trt + (1 + time | id),
+  dataSurv  = datJM3_S, dataLong = datJM3_L,
+  id = "id", timeVar = "time", assoc = "CV",
+  control = list(int.strategy = "eb")
+)
+
+summary(M_jmCV, sdcor = TRUE)
+```
+
+**Interpretation.** The association parameter `CV_L1_S1` represents the log-hazard ratio per one-unit increase in the true marker value at any time $t$. A positive value means that individuals whose true marker value is currently high face an elevated risk of the event at that moment. Because treatment affects the longitudinal trajectory (through $\beta_2$ and $\beta_3$), treatment's effect on survival operates indirectly through this association, a key advantage of the joint model.
+
+```{r}
+Plots_jm <- plot(M_jmCV)
+TV3 <- c(s_1)
+ggarrange(eval(parse(text = P1)),
+          ggarrange(eval(parse(text = P2)),
+                    eval(parse(text = P3)), ncol = 2), nrow = 2)
+```
+
+## Current slope (CS)
+
+The **current slope** association focuses on the *dynamic behaviour* of the marker rather than its level. It uses the derivative of the linear predictor with respect to time, which describes the rate of change at time $t$:
+
+$$\lambda_i(t) = \lambda_0(t) \exp\left(\gamma \cdot \frac{d\eta_i(t)}{dt}\right)$$
+
+For our random intercept-slope model, the derivative is simply $\beta_1 + b_{i1} + \beta_3 \cdot trt_i$, which is the individual-specific slope. This structure can answer a distinct clinical question: **do two patients with the same current marker level but different rates of change have different risks?** For instance, two patients both at biomarker value 5, one whose marker is rapidly increasing, one whose marker is stable, have the same risk under the CV model but potentially very different risks under the CS model. A positive $\gamma$ means that a more rapidly increasing marker at time $t$ translates to a higher instantaneous hazard, independently of the current level.
+
+For more complex longitudinal models using splines, `INLAjoint` computes the derivative numerically via the `numDeriv` package.
+
+```{r}
+set.seed(4)
+CS_i <- (b_1 + b22) + b_3 * trt2   # slope of the linear predictor
+
+DatTmp <- permalgorithm(n, n_i2, Xmat = matrix(CS_i, ncol = 1), betas = c(s_2))
+DatTmp2 <- DatTmp[which(!duplicated(DatTmp$Id, fromLast = TRUE)),
+                  c("Id", "Event", "Stop")]
+
+datJM4_S <- data.frame(id = 1:n, eventTimes = mestime2[DatTmp2$Stop + 1],
+                        eventIndic = DatTmp2$Event, trt = trt)
+
+datJM4_L <- datJM_Lt[-unlist(sapply(1:n, function(x)
+  which(datJM_Lt$time >= datJM4_S$eventTimes[datJM4_S$id == x] &
+          datJM_Lt$id == x))), ]
+```
+
+We fit the model with `assoc = "CS"`:
+
+```{r}
+M_jmCS <- joint(
+  formSurv = inla.surv(eventTimes, eventIndic) ~ -1,
+  formLong  = Y ~ time * trt + (1 + time | id),
+  dataSurv  = datJM4_S, dataLong = datJM4_L,
+  id = "id", timeVar = "time", assoc = "CS",
+  control = list(int.strategy = "eb")
+)
+
+summary(M_jmCS, sdcor = TRUE)
+```
+
+**Interpretation.** The parameter `CS_L1_S1` is the log-hazard ratio for a one-unit increase in the instantaneous rate of change. Because the slope is time-constant in our linear model, this structure induces a time-constant effect here. In a more realistic setting with non-linear longitudinal trajectories (e.g., initial decline followed by plateau), the derivative varies over time and the CS structure captures the prognostic value of the trend at each moment independently of the current level.
+
+```{r}
+Plots_jm <- plot(M_jmCS)
+TV3 <- c(s_2)
+ggarrange(eval(parse(text = P1)),
+          ggarrange(eval(parse(text = P2)),
+                    eval(parse(text = P3)), ncol = 2), nrow = 2)
+```
+
+## Current slope with non-linear trends
+
+In the previous example the longitudinal model was strictly linear. The current slope was simply the individual rate of change which remained constant over time. Real biomarker data often show more complex dynamics. As we saw in the longitudinal session we can model non-linear trends by adding functions of time like quadratic terms or splines.
+
+When we introduce a non-linear term the current slope becomes time-dependent. The rate of change evolves at each moment. To link this changing slope to the survival risk `INLAjoint` needs to compute the derivative of the linear predictor.
+
+To do this the software uses `numDeriv` which is the standard package in R for numerical derivatives. You only need to define your time function in R and pass it to the model formula. `INLAjoint` will automatically evaluate the numerical derivative to compute the current slope at any given time. This makes it possible to include any function of time easily.
+
+Let us update our simulation to include a quadratic term. We define a simple function `f1 <- function(x) x^2` and add it to the fixed and random effects. The survival risk is now driven by the time-varying derivative of this quadratic profile.
+
+```{r}
+set.seed(5)
+f1 <- function(x) x^2
+n <- 500
+mestime <- seq(0, fw, 0.1) # more repeated measurements (every 0.1 units of time)
+n_i <- length(mestime)
+time <- rep(mestime, n)
+id <- rep(1:n, each = n_i)
+trt <- rbinom(n, 1, 0.5)
+trtY <- rep(trt, each = length(mestime))
+sds <- c(0.5, 0.5, 0.7)
+cor_val <- 0.3
+R <- matrix(cor_val, 3, 3); diag(R) <- 1
+Sigma <- diag(sds) %*% R %*% diag(sds)
+MVnorm <- rmvnorm(n, mean = rep(0, 3), sigma = Sigma)
+b1 <- rep(MVnorm[, 1], each = n_i)
+b2 <- rep(MVnorm[, 2], each = n_i)
+b3 <- rep(MVnorm[, 3], each = n_i) # random effect of time^2
+b_4 <- 0.2 # fixed effect of time^2
+# update longitudinal
+linPred <- b_0 + b1 + (b_1 + b2) * time + b_2 * trtY + b_3 * trtY * time + (b_4 + b3) * f1(time)
+Y <- rnorm(n_i * n, linPred, b_e)
+datJM_Lt2 <- data.frame(id, time, Y, trt = trtY)
+gap2 <- 0.01
+mestime2 <- seq(0, fw, gap2)
+time2 <- rep(mestime2, n)
+n_i2 <- length(mestime2)
+trt2 <- rep(trt, each = n_i2)
+# b12 <- rep(MVnorm[, 1], each = n_i2)
+b22 <- rep(MVnorm[, 2], each = n_i2)
+b32 <- rep(MVnorm[, 3], each = n_i2)
+# Evaluate the linear predictor on the fine grid for survival simulation => time2 instead of time
+CS2_i <- (b_1 + b22) + b_3 * trt2 + 2 * (b_4 + b32) * time2 # slope of the linear predictor
+
+DatTmp <- permalgorithm(n, n_i2, Xmat = matrix(CS2_i, ncol = 1), betas = c(s_2))
+DatTmp2 <- DatTmp[which(!duplicated(DatTmp$Id, fromLast = TRUE)),
+                  c("Id", "Event", "Stop")]
+
+datJM5_S <- data.frame(id = 1:n, eventTimes = mestime2[DatTmp2$Stop + 1],
+                        eventIndic = DatTmp2$Event, trt = trt)
+
+datJM5_L <- datJM_Lt2[-unlist(sapply(1:n, function(x)
+  which(datJM_Lt2$time >= datJM5_S$eventTimes[datJM5_S$id == x] &
+          datJM_Lt2$id == x))), ]
+```
+
+We fit the model with assoc = "CS" and include the new quadratic function in the longitudinal formula:
+
+```{r}
+M_jmCS2 <- joint(
+  formSurv = inla.surv(eventTimes, eventIndic) ~ -1,
+  formLong  = Y ~ time * trt + f1(time) + (1 + time + f1(time)| id),
+  dataSurv  = datJM5_S, dataLong = datJM5_L,
+  id = "id", timeVar = "time", assoc = "CS",
+  control = list(int.strategy = "eb")
+)
+
+summary(M_jmCS2, sdcor = TRUE)
+```
+
+The model accurately estimates the association parameter (CS_L1_S1). A positive value confirms that a steepening trend increases the risk of the event at that specific time independently of the underlying linear baseline.
+
+We can visualize the recovery of the parameters including the new variance component for the quadratic random effect.
+
+```{r}
+Plots_jm <- plot(M_jmCS2)
+TV1 <- c(b_0, b_1, b_2, b_4, b_3, b_e^2)
+TV2 <- c(Sigma)
+TV3 <- c(s_2)
+eval(parse(text = P1))
+eval(parse(text = P2))
+eval(parse(text = P3))
+```
+
+## Priors for the association parameters {.unnumbered}
+
+The association parameters are treated as fixed effects (but internally parametrized as hyperparameters!), assigned a zero-centered Gaussian prior. A few control arguments set the defaults.
+
+- `priorSRE_ind` (default `list(mean = 0, prec = 1)`): prior for the `SRE_ind` association. It has its own argument because this structure links time-constant components, unlike the structures below which can change over time.
+- `priorAssoc` (default `list(mean = 0, prec = 0.01)`): shared prior for the `SRE`, `CV` and `CS` associations.
+- `assocInit` (default `0.1`): starting value for the association parameters. The effect on the final fit is negligible in INLA. The cumulative-value (AUC) prior is set directly in R-INLA and matches the `CV` defaults.
+
+The defaults are weak, so the data drives the estimate. A tighter prior centered at zero pulls the estimate toward no association, a useful sensitivity check.
+
+# Application to the cancer trial data
+
+We return to our simulated cancer clinical trial dataset. In the survival analysis session, a standard Cox model showed **no significant difference** between Treatment A and Treatment B. In the longitudinal data analysis session, a mixed model showed that Treatment B shrinks the tumor significantly faster than Treatment A.
+
+We can compare the different association structures available to investigate the treatment effects. Treatment is included in both submodels: it affects the longitudinal trajectory and the hazard.
+
+```{r}
+load("cancer_trial_data.RData")
+
+longDat$Treatment <- factor(longDat$trt, levels = c(0, 1),
+                             labels = c("B (chemo)", "A (immuno)"))
+survDat$Treatment <- factor(survDat$trt, levels = c(0, 1),
+                             labels = c("B (chemo)", "A (immuno)"))
+
+JM_cancer_cv <- joint(
+  formLong  = SLD ~ time * trt + (1 + time | id),
+  dataLong  = longDat,
+  id = "id", timeVar = "time",
+  formSurv  = inla.surv(deathTimes, death) ~ trt,
+  dataSurv  = survDat, basRisk = "rw2",
+  assoc = "CV", control = list(int.strategy = "eb")
+)
+
+summary(JM_cancer_cv, hr = TRUE)
+
+JM_cancer_sre <- joint(
+  formLong  = SLD ~ time * trt + (1 + time | id),
+  dataLong  = longDat,
+  id = "id", timeVar = "time",
+  formSurv  = inla.surv(deathTimes, death) ~ trt,
+  dataSurv  = survDat, basRisk = "rw2",
+  assoc = "SRE", control = list(int.strategy = "eb")
+)
+
+summary(JM_cancer_sre, hr = TRUE)
+
+JM_cancer_cs <- joint(
+  formLong  = SLD ~ time * trt + (1 + time | id),
+  dataLong  = longDat,
+  id = "id", timeVar = "time",
+  formSurv  = inla.surv(deathTimes, death) ~ trt,
+  dataSurv  = survDat, basRisk = "rw2",
+  assoc = "CS", control = list(int.strategy = "eb")
+)
+
+summary(JM_cancer_cs, hr = TRUE)
+
+JM_cancer_cvcs <- joint(
+  formLong  = SLD ~ time * trt + (1 + time | id),
+  dataLong  = longDat,
+  id = "id", timeVar = "time",
+  formSurv  = inla.surv(deathTimes, death) ~ trt,
+  dataSurv  = survDat, basRisk = "rw2",
+  assoc = "CV_CS", control = list(int.strategy = "eb")
+)
+
+summary(JM_cancer_cvcs, hr = TRUE)
+
+joint.compare(JM_cancer_cv, JM_cancer_sre, JM_cancer_cs, JM_cancer_cvcs)
+```
+
+While there is no significant difference between the modeling approaches, the lowest WAIC is with the CV_CS approach. However, looking at the summary, we can see the current slope part is not significant. We therefore keep the current value specification (which is the true one used for data generation).
+
+Because this test procedure combines a Bayesian predictive criterion with a frequentist testing framework, the resulting p-values should be interpreted as complementary evidence rather than as a formal Bayesian decision rule!
+
+We extract the key parameters from the summary:
+
+```{r}
+cv_assoc <- JM_cancer_cv$summary.hyperpar[
+  grep("CV_L1_S1", rownames(JM_cancer_cv$summary.hyperpar)),
+  c("mean", "0.025quant", "0.975quant")]
+
+key_rows <- rbind(
+  `Survival direct effect (trt_S1)`       = JM_cancer_cv$summary.fixed[
+    "trt_S1", c("mean", "0.025quant", "0.975quant")],
+  `Longitudinal efficacy (time.X.trt_L1)` = JM_cancer_cv$summary.fixed[
+    "time.X.trt_L1", c("mean", "0.025quant", "0.975quant")],
+  `Current value association (CV_L1_S1)`  = cv_assoc
+)
+
+round(key_rows, 3)
+```
+
+**Interpretation:**
+
+1.  **Current value association** (`CV_L1_S1`): positive. A larger expected tumor size is associated with a higher hazard of death.
+
+2.  **Longitudinal effect** (`time.X.trt_L1`): positive and significant. Treatment A (immunotherapy) has an increasing average trend while Treatment B (chemotherapy) decreases over time. Treatment B shrinks tumors, an *indirect* survival benefit that operates via the CV association.
+
+3.  **Survival direct effect** (`trt_S1`): negative and significant. Treatment A provides a strong *direct* protective effect on survival, independent of the tumor trajectory. This represents a survival benefit that cannot be explained by changes in tumor size alone.
+
+The joint model therefore decomposes two competing mechanisms: Treatment B controls the tumor aggressively (indirect benefit via marker) but carries a direct survival penalty (likely severe toxicity). Treatment A does not shrink tumors but provides a direct survival benefit. The marginal Cox model seen earlier averaged over these two opposing effects, producing apparent non-significance.
+
+## Decomposition of the treatment effect
+
+Under the CV association, the treatment contrast on the log-hazard scale decomposes as the sum of a direct term and an SLD-mediated term:
+
+$$\log \widehat{HR}_{A:B}(t) = \underbrace{\gamma_{\text{trt}}}_{\text{direct}} + \underbrace{\alpha_{\text{cv}}\{\eta_A(t) - \eta_B(t)\}}_{\text{SLD-mediated}}$$
+
+```{r}
+beta <- setNames(JM_cancer_cv$summary.fixed[, 1],
+                 rownames(JM_cancer_cv$summary.fixed))
+alpha_cv <- JM_cancer_cv$summary.hyperpar[
+  grep("CV_L1_S1", rownames(JM_cancer_cv$summary.hyperpar)), "mean"]
+
+time_grid <- seq(0, 5, length.out = 100)
+
+eta_B <- beta["Intercept_L1"] + beta["time_L1"] * time_grid
+eta_A <- beta["Intercept_L1"] + beta["trt_L1"] +
+  (beta["time_L1"] + beta["time.X.trt_L1"]) * time_grid
+
+decomp <- data.frame(
+  time           = time_grid,
+  direct         = unname(beta["trt_S1"]),
+  marker_related = unname(alpha_cv * (eta_A - eta_B))
+)
+decomp$total <- decomp$direct + decomp$marker_related
+
+decomp_long <- rbind(
+  data.frame(time = decomp$time, Component = "Direct survival term",  logHR = decomp$direct),
+  data.frame(time = decomp$time, Component = "SLD-mediated term",     logHR = decomp$marker_related),
+  data.frame(time = decomp$time, Component = "Total (CV model)",      logHR = decomp$total)
+)
+
+ggplot(decomp_long, aes(x = time, y = exp(logHR), color = Component)) +
+  geom_hline(yintercept = 1, linetype = 2, color = "gray50") +
+  geom_line(linewidth = 1.1) +
+  scale_color_manual(values = c("steelblue", "darkorange", "black")) +
+  labs(x = "Time (years)", y = "Hazard ratio: A vs B", color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The SLD-mediated term (orange) grows over time as Treatment B's tumor shrinkage creates differences between the two groups. The direct term (blue) is a constant benefit for Treatment A, after accounting from the effect mediated by tumors. Their sum (black) cross the 1 line corresponding to no treatment differences. This is why the marginal survival models found no differences between the two treatment lines.
+
+## Predictions
+
+The predict function can be useful to extract quantities of interest from the fitted models.
+
+Given a patient's observed longitudinal history up to time $t$, the model updates the posterior distribution of their latent trajectory and derives both their future biomarker trajectory and their survival probability.
+
+For example we can consider a new patient with one or multiple measurements of the longitudinal biomarker. We can ask the predict function to compute survival probabilities conditional on treatment to guide decision-making:
+
+```{r}
+NewData <- longDat[c(1,1), ]
+NewData$trt[2] <- 1
+NewData$Treatment[2] <- unique(longDat$Treatment)[2]
+NewData$id[2] <- 2
+
+P_dynamic <- predict(
+  JM_cancer_cv,
+  newData  = NewData,
+  horizon  = 5,
+  survival = TRUE,
+  id       = "id"
+)
+```
+
+We can plot the survival curve for each treatment line, conditional on the baseline biomarker measurement:
+
+```{r}
+p_traj <- ggplot(P_dynamic$PredL, aes(x = time, y = quant0.5)) +
+  facet_wrap(~id, labeller = label_both) +
+  geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975),
+              alpha = 0.2, fill = "steelblue", color = NA) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(data = NewData, aes(x = time, y = SLD), size = 1.5) +
+  labs(x = "Time (years)", y = "Tumor Size (SLD)",
+       title = "Predicted Longitudinal Trajectories") +
+  theme_minimal()
+
+p_surv <- ggplot(P_dynamic$PredS, aes(x = time, y = Surv_quant0.5)) +
+  facet_wrap(~id, labeller = label_both) +
+  geom_ribbon(aes(ymin = Surv_quant0.025, ymax = Surv_quant0.975),
+              alpha = 0.2, fill = "darkred", color = NA) +
+  geom_line(color = "darkred", linewidth = 1) +
+  labs(x = "Time (years)", y = "Survival probability",
+       title = "Predicted Survival") +
+  ylim(0, 1) +
+  theme_minimal()
+
+ggarrange(p_traj, p_surv, ncol = 2)
+```
+
+We can also remove the condition on the biomarker measurement by setting it to NA. We can compute
+
+### Dynamic predictions
+
+**Personalised dynamic prediction**: given a patient's observed longitudinal history up to time $t$, the model updates the posterior distribution of their latent trajectory and derives both their future biomarker trajectory and their survival probability.
+
+We select two patients with different observed profiles:
+
+```{r}
+patient_ids <- unique(longDat$id)[1:2]
+NewData <- longDat[longDat$id %in% patient_ids, ]
+
+P_dynamic <- predict(
+  JM_cancer_cv,
+  newData  = NewData,
+  horizon  = 5,
+  survival = TRUE,
+  id       = "id"
+)
+```
+
+```{r}
+p_traj <- ggplot(P_dynamic$PredL, aes(x = time, y = quant0.5)) +
+  facet_wrap(~id, labeller = label_both) +
+  geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975),
+              alpha = 0.2, fill = "steelblue", color = NA) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(data = NewData, aes(x = time, y = SLD), size = 1.5) +
+  labs(x = "Time (years)", y = "Tumor Size (SLD)",
+       title = "Predicted Tumor Profile") +
+  theme_minimal()
+
+p_surv <- ggplot(P_dynamic$PredS, aes(x = time, y = Surv_quant0.5)) +
+  facet_wrap(~id, labeller = label_both) +
+  geom_ribbon(aes(ymin = Surv_quant0.025, ymax = Surv_quant0.975),
+              alpha = 0.2, fill = "darkred", color = NA) +
+  geom_line(color = "darkred", linewidth = 1) +
+  labs(x = "Time (years)", y = "Survival probability",
+       title = "Predicted Absolute Survival") +
+  ylim(0, 1) +
+  theme_minimal()
+
+ggarrange(p_traj, p_surv, ncol = 2)
+```
+
+The model uses the observed biomarker history to infer each patient's latent trajectory and translates that trajectory into a survival probability through the association.
+
+What if patient 2 had also a decreasing tumor size?
+
+```{r}
+patient_ids <- unique(longDat$id)[1:2]
+NewData2 <- longDat[longDat$id %in% patient_ids, ]
+NewData2[NewData2$id==2, "SLD"] <- 5-NewData2[NewData2$id==2, "SLD"]
+
+P_dynamic <- predict(
+  JM_cancer_cv,
+  newData  = NewData2,
+  horizon  = 5,
+  survival = TRUE,
+  id       = "id"
+)
+```
+
+```{r}
+p_traj <- ggplot(P_dynamic$PredL, aes(x = time, y = quant0.5)) +
+  facet_wrap(~id, labeller = label_both) +
+  geom_ribbon(aes(ymin = quant0.025, ymax = quant0.975),
+              alpha = 0.2, fill = "steelblue", color = NA) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(data = NewData2, aes(x = time, y = SLD), size = 1.5) +
+  labs(x = "Time (years)", y = "Tumor Size (SLD)",
+       title = "Predicted Tumor Profile") +
+  theme_minimal()
+
+p_surv <- ggplot(P_dynamic$PredS, aes(x = time, y = Surv_quant0.5)) +
+  facet_wrap(~id, labeller = label_both) +
+  geom_ribbon(aes(ymin = Surv_quant0.025, ymax = Surv_quant0.975),
+              alpha = 0.2, fill = "darkred", color = NA) +
+  geom_line(color = "darkred", linewidth = 1) +
+  labs(x = "Time (years)", y = "Survival probability",
+       title = "Predicted Absolute Survival") +
+  ylim(0, 1) +
+  theme_minimal()
+
+ggarrange(p_traj, p_surv, ncol = 2)
+```
+
+Now patient 2 has a much better profile because he has both the tumor shrinkage and the non-toxicity (although in this simplistic toy example this profile is unexpected, thus leading to a poor fit =\> tail of the random effects).
+
+## Updating predictions at different landmark times
+
+A strength of joint models in clinical practice is that predictions can be **updated** as new measurements arrive. We demonstrate this for one patient: first predicting from year 1, then updating the prediction at year 2.5.
+
+```{r}
+patient_data <- NewData[NewData$id == patient_ids[1], ]
+
+P_year1 <- predict(
+  JM_cancer_cv,
+  newData  = patient_data[patient_data$time <= 0.5, ],
+  horizon  = 5, Csurv = 0.5, survival = TRUE, id = "id"
+)
+
+P_year2 <- predict(
+  JM_cancer_cv,
+  newData  = patient_data[patient_data$time <= 1, ],
+  horizon  = 5, Csurv = 1, survival = TRUE, id = "id"
+)
+```
+
+```{r}
+surv_y1 <- P_year1$PredS
+surv_y1$Landmark <- "Data up to Year 0.5"
+surv_y1 <- surv_y1[surv_y1$time >= 0.5, ]
+
+surv_y2 <- P_year2$PredS
+surv_y2$Landmark <- "Data up to Year 1"
+surv_y2 <- surv_y2[surv_y2$time >= 1, ]
+
+update_df <- rbind(surv_y1, surv_y2)
+
+ggplot(update_df, aes(x = time, y = Surv_quant0.5,
+                       color = Landmark, fill = Landmark)) +
+  geom_ribbon(aes(ymin = Surv_quant0.025, ymax = Surv_quant0.975),
+              alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1.1) +
+  scale_color_manual(values = c("steelblue", "darkred")) +
+  scale_fill_manual(values  = c("steelblue", "darkred")) +
+  labs(x = "Time (years)", y = "Conditional survival probability",
+       title = "Dynamic risk updating") +
+  ylim(0, 1) + xlim(0,5) +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.title = element_blank())
+```
+
+This updating mechanism, conditioning on the entire observed history, is what makes joint model predictions *dynamic*.
+
+# Conclusion
+
+We started with simple survival models biased by unmeasured heterogeneity and informative censoring. We moved to longitudinal mixed-effects models to map the true tumor dynamics. Finally we brought the two processes together using `INLAjoint`.
+
+The association structures covered SRE_ind, SRE, CV and CS, each answer a different scientific question about how\* a longitudinal biomarker relates to survival. Choosing the right structure is a scientific decision guided by the biological question, not just model fit. The Bayesian INLA framework provides posterior distributions for all parameters simultaneously, handles informative censoring, and produces calibrated dynamic predictions all in computation times far below what MCMC-based approaches would require for models of this complexity.
+
+| Structure | Best when... |
+|:-----------------------------------|:-----------------------------------|
+| `SRE_ind` | Individual deviation from the population drives risk |
+| `SRE` | The evolving gap between an individual's trajectory and the population mean drives risk |
+| `CV` | The true instantaneous marker level drives risk, including all covariate effects |
+| `CS` | The rate of change of the marker drives risk |
+| `CV_CS` | Both the level and the trend are independently prognostic |
+
+An important point is the proportional hazards assumption which is conditional on the shared component in joint models, this makes the assumptions much less strict compared to standard Cox models.
+
+[Q]{style="color: purple;"}
